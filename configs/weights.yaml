@@ -1,0 +1,14 @@
+sample_rate: 48000         # project SR for I/O
+f0_sr: 16000               # downsample for F0 (torchcrepe is happiest here)
+frame_size: 1024
+hop_size: 256
+
+weights:
+  accuracy: {pitch_rmse: 0.5, snr: 0.2, deess: 0.2, clip_ok: 0.1} # pitch = 50%; noise_level (snr), sibilants = 20%; c
+                                                                  # clipping = 10%
+  emotion:  {vibrato_stability: 0.34, dyn_shape: 0.33, microtiming: 0.33} # all three equal 33% (vibrato, dynamic, onbeat)
+
+alpha: 0.6 #60% for accuracy for MVP
+vetoes: {min_snr_db: 10, max_clip_events: 2} #too noisy/too loud
+diversity_delta: 0.07
+top_k: 3
