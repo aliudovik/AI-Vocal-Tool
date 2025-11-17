@@ -12,7 +12,7 @@ def rms_dbfs(x):
         return -999.0
     return 20*np.log10(r + 1e-20)
 
-def main(root="data_pilot\songA"):
+def main(root="data_pilot"):
     root = Path(root).resolve()
     print(f"[info] scanning: {root}")
     wavs = list(root.rglob("*.wav"))
