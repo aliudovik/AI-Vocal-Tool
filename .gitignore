@@ -232,13 +232,13 @@ mlruns/
 *.env.*
 secrets/
 
-# --- Node/UI (if you add a small web/desktop UI) ---
+# --- Node/UI ---
 node_modules/
 npm-debug.log*
 .yarn/*
 .pnpm-store/
 
-# --- C++/JUCE (optional, if you add a plugin later) ---
+# --- C++/JUCE ---
 *.user
 *.obj
 *.pdb
