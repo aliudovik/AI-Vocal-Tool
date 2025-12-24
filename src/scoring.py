@@ -1,5 +1,5 @@
 # Scoring utilities:
-# - norm_block: normalize accuracy-related primitives to 0..1
+# - norm_block: normalize accuracy scale to 0..1
 # - accuracy_score: weighted sum for "Accuracy" persona
 # - emotion_score: weighted sum of MVP emotion features (already 0..1)
 # - final_blend: alpha * accuracy + (1 - alpha) * emotion
@@ -21,7 +21,7 @@ def _safe(v, fallback):
 
 def norm_block(row):
     """
-    Normalize accuracy primitives to 0..1 scales.
+    Normalize accuracy to 0..1 scales.
     Inputs expected in 'row':
       - f0_rmse_c (cents, lower better)
       - snr_db (dB, higher better)
@@ -35,7 +35,7 @@ def norm_block(row):
     snr_val = min(float(_safe(row.get('snr_db'), 0.0)), 40.0)
     snr = linmap(snr_val, 0.0, 40.0)
 
-    # De-ess: simple inverse map (OK for MVP; triangle option is in features if you prefer)
+    # De-ess: simple inverse map
     deess = 1.0 - linmap(float(_safe(row.get('deess_ratio'), 0.30)), 0.03, 0.30)
 
     # Clipping penalty

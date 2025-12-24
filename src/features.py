@@ -1,5 +1,3 @@
-# Feature extraction helpers for pitch/clarity + emotion features - for MVP only currently.
-
 import numpy as np
 import librosa
 import torch
@@ -302,14 +300,35 @@ def microtiming(y, sr):
     return float(np.clip(jt_score, 0.0, 1.0))
 
 
-def vibrato_analysis(f0, pd, sr16=16000, hop=256, pd_thresh=0.6):
+def vibrato_analysis(
+    f0,
+    pd,
+    sr16=16000,
+    hop=256,
+    pd_thresh=0.6,
+    sustain_min_ms=250.0,
+    sustain_slope_cents=5.0,
+):
     """
-    Return intermediate vibrato stats to help debug:
-      - frames_voiced, fps, peak_hz, depth_cents, rate_score, depth_score, vib_score
-    Mirrors vibrato_stability() logic.
+    Analyze vibrato on sustained portions of the note.
+
+    Returns a dict with:
+      - frames_voiced
+      - fps
+      - peak_hz
+      - depth_cents
+      - rate_score
+      - depth_score
+      - vib_score              (rate_score * depth_score, using chosen region)
+      - sustain_frames         (# frames considered "sustained")
+      - sustain_pct            (sustain_frames / frames_voiced)
+      - sustain_segments       (number of sustained segments)
+      - sustain_score          (0..1, how "sustained" the note is)
+      - vib_score_weighted     (vib_score * sustain_score)
     """
     fps = float(sr16) / float(hop)
     voiced = (f0 > 0) & (pd >= pd_thresh)
+
     out = {
         "frames_voiced": int(voiced.sum()),
         "fps": fps,
@@ -318,45 +337,103 @@ def vibrato_analysis(f0, pd, sr16=16000, hop=256, pd_thresh=0.6):
         "rate_score": 0.0,
         "depth_score": 0.0,
         "vib_score": 0.0,
+        "sustain_frames": 0,
+        "sustain_pct": 0.0,
+        "sustain_segments": 0,
+        "sustain_score": 0.0,
+        "vib_score_weighted": 0.0,
     }
+
     if voiced.sum() < 16:
         return out
 
     f0v = f0[voiced]
     cents_rel = cents(f0v, np.median(f0v))
 
+    # ---------------------------------------------------------------------
+    # 1) Detect sustained regions within voiced frames
+    # ---------------------------------------------------------------------
+    min_sustain_frames = max(3, int(round((sustain_min_ms / 1000.0) * fps)))
+
+    stable = np.zeros_like(f0v, dtype=bool)
+    if len(f0v) > 1:
+        dc = np.abs(np.diff(cents_rel))  # cents change frame-to-frame
+        stable[1:] = dc < sustain_slope_cents
+        stable[0] = stable[1] if len(stable) > 1 else False
+
+    # Run-length encode "stable" TRUE segments to find sustained chunks
+    sustain_segments = []
+    if stable.any():
+        idx = np.flatnonzero(stable)
+        # Split where indices are not consecutive
+        splits = np.where(np.diff(idx) > 1)[0] + 1
+        groups = np.split(idx, splits)
+        for g in groups:
+            if len(g) >= min_sustain_frames:
+                sustain_segments.append(g)
+
+    sustain_frames = int(sum(len(g) for g in sustain_segments))
+    sustain_pct = float(sustain_frames) / float(len(f0v)) if len(f0v) > 0 else 0.0
+    sustain_segments_count = len(sustain_segments)
+
+    # Simple sustain score: more sustained fraction = > higher score
+    sustain_score = float(band_score(sustain_pct, low=0.1, mid=0.4, high=0.8))
+
+    out.update({
+        "sustain_frames": sustain_frames,
+        "sustain_pct": sustain_pct,
+        "sustain_segments": sustain_segments_count,
+        "sustain_score": sustain_score,
+    })
+
+    # ---------------------------------------------------------------------
+    # 2) Detrend and compute vibrato
+    #    - Prefer longest sustained segment, fall back to all voiced frames
+    # ---------------------------------------------------------------------
     # Detrend with ~200 ms moving average
     win = max(3, int(round(0.20 * fps)))
     kernel = np.ones(win) / float(win)
     trend = np.convolve(cents_rel, kernel, mode="same")
     vib = cents_rel - trend
 
-    n = len(vib)
+    # Choose analysis indices
+    if sustain_segments:
+        # Use longest sustained segment
+        longest_seg = max(sustain_segments, key=len)
+        vib_segment = vib[longest_seg]
+    else:
+        # Fall back to all voiced frames
+        vib_segment = vib
+
+    n = len(vib_segment)
     if n < 16:
         return out
 
     freqs = np.fft.rfftfreq(n, d=1.0 / fps)
-    mag = np.abs(np.fft.rfft(vib))
+    mag = np.abs(np.fft.rfft(vib_segment))
     band = (freqs >= 3.0) & (freqs <= 9.0)
     if not np.any(band):
         return out
 
     peak_idx = np.argmax(mag[band])
     peak_hz = float(freqs[band][peak_idx])
-    depth_cents = float(np.sqrt(np.mean(vib ** 2)))
+    depth_cents = float(np.sqrt(np.mean(vib_segment ** 2)))
 
-    rate_score  = band_score(peak_hz, low=4.0,  mid=5.5,  high=7.5)
+    rate_score  = band_score(peak_hz,    low=4.0,  mid=5.5,  high=7.5)
     depth_score = band_score(depth_cents, low=10.0, mid=45.0, high=100.0)
     vib_score   = float(rate_score * depth_score)
+    vib_score_weighted = float(vib_score * sustain_score)
 
     out.update({
         "peak_hz": peak_hz,
         "depth_cents": depth_cents,
         "rate_score": float(rate_score),
         "depth_score": float(depth_score),
-        "vib_score": vib_score,
+        "vib_score": vib_score,  # raw vibrato quality (rate * depth)
+        "vib_score_weighted": vib_score_weighted,  # vibrato × sustain quality
     })
     return out
+
 
 
 def microtiming_analysis(y, sr):

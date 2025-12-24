@@ -1,6 +1,6 @@
 sample_rate: 48000         # project SR for I/O
-f0_sr: 16000               # downsample for F0 (torchcrepe is happiest here)
-frame_size: 1024
+f0_sr: 16000               # 16 k for torchcrepe
+frame_size: 1024 # might enlargen if too long processing
 hop_size: 256
 
 weights:
@@ -8,7 +8,7 @@ weights:
                                                                   # clipping = 10%
   emotion:  {vibrato_stability: 0.34, dyn_shape: 0.33, microtiming: 0.33} # all three equal 33% (vibrato, dynamic, onbeat)
 
-alpha: 0.6 #60% for accuracy for MVP
+alpha: 0.6
 vetoes: {min_snr_db: 10, max_clip_events: 2} #too noisy/too loud
 diversity_delta: 0.07
 top_k: 3

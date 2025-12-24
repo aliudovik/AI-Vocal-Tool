@@ -50,15 +50,37 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def parse_selection(sel):
     """
-    Parse "singer01/phrase02" -> ("singer01/phrase02", "01", "02")
-    Returns (rel_path, singer_num, phrase_num) where nums may be 'xx'/'yy' if not found.
+    Parse a selection string like:
+      - "singer01/phrase02"    -> ("singer01/phrase02", "01",   "02")
+      - "singer_user/phrase01" -> ("singer_user/phrase01", "user", "01")
+
+    Returns (rel_path, singer_id, phrase_num) where:
+      - rel_path is the normalized relative path (slashes, no leading/trailing slash)
+      - singer_id is either a zero-padded numeric ID ("01") or a string label ("user")
+      - phrase_num is a zero-padded 2-digit phrase index ("01", "02", ...)
     """
-    m = re.search(r"singer\s*0*([0-9]+)", sel, flags=re.IGNORECASE)
-    n = re.search(r"phrase\s*0*([0-9]+)", sel, flags=re.IGNORECASE)
-    s_num = m.group(1).zfill(2) if m else "xx"
-    p_num = n.group(1).zfill(2) if n else "yy"
+    # Normalized relative path
     rel = sel.replace("\\", "/").strip("/")
-    return rel, s_num, p_num
+
+    # Phrase number (always numeric, zero-padded to 2)
+    n = re.search(r"phrase\s*0*([0-9]+)", sel, flags=re.IGNORECASE)
+    phrase_num = n.group(1).zfill(2) if n else "yy"
+
+    # Singer: numeric or label (e.g. "user")
+    m_num = re.search(r"singer\s*0*([0-9]+)", sel, flags=re.IGNORECASE)
+    m_label = re.search(r"singer[_\s]*([A-Za-z]+)", sel, flags=re.IGNORECASE)
+
+    if m_num:
+        # e.g. "singer01" -> "01"
+        singer_id = m_num.group(1).zfill(2)
+    elif m_label:
+        # e.g. "singer_user" -> "user"
+        singer_id = m_label.group(1).lower()
+    else:
+        singer_id = "xx"
+
+    return rel, singer_id, phrase_num
+
 
 
 def prompt_if_missing(args):
@@ -132,59 +154,52 @@ def _map_f0_to_times(f0, y_len, sr):
     # frames from [0, dur) with equal spacing
     return np.linspace(0.0, dur, num=n, endpoint=False, dtype=np.float32)
 
+def run_feature_extraction(
+    base,
+    select,
+    alpha_pct,
+    bpm,
+    cfg_path="configs/weights.yaml",
+    out_dir="outputs",
+    debug_emotion=False,
+    explicit_compmap_path=None,
+):
 
-def main():
-    ap = argparse.ArgumentParser(
-        description=(
-            "Extract features for a selected phrase, compute Accuracy/Emotion scores, "
-            "segment the best take, and produce per-segment rankings + comp map. "
-            "If --select/--alpha_pct/--bpm are omitted, you'll be prompted."
-        )
-    )
-    ap.add_argument(
-        "--base",
-        default="data_pilot",
-        help="Base folder containing singer/phrase directories (default: data_pilot)",
-    )
-    ap.add_argument(
-        "--select",
-        default=None,
-        help='Phrase selection, e.g. "singer01/phrase02". If omitted, will prompt.',
-    )
-    ap.add_argument(
-        "--alpha_pct",
-        type=int,
-        default=None,
-        help="Accuracy weight in percent (Emotion gets the rest). If omitted, will prompt.",
-    )
-    ap.add_argument(
-        "--bpm",
-        type=float,
-        default=None,
-        help="Tempo in BPM for this phrase. If omitted, will prompt.",
-    )
-    ap.add_argument(
-        "--cfg",
-        default="configs/weights.yaml",
-        help="YAML with sample_rate, f0_sr, weights, etc.",
-    )
-    ap.add_argument(
-        "--out_dir",
-        default="outputs",
-        help="Folder to write CSV/JSON outputs into",
-    )
-    ap.add_argument(
-        "--debug_emotion",
-        action="store_true",
-        help="Print vibrato/microtiming debug stats per segment",
-    )
-    args = ap.parse_args()
+    """
+    Programmatic entry point for feature extraction + comp map generation.
 
-    # Interactive fallback
-    select_str, alpha_pct, bpm = prompt_if_missing(args)
+    This encapsulates the logic that was previously in main(), but without
+    any interactive prompts or argparse dependency.
+
+    Args:
+        base (str or Path):
+            Base folder containing singer/phrase dirs (e.g. "data_pilot").
+        select (str):
+            Phrase selection string, e.g. "singer01/phrase02".
+        alpha_pct (int):
+            Accuracy weight in percent; Emotion gets the remainder.
+        bpm (float):
+            Tempo in BPM.
+        cfg_path (str or Path):
+            YAML configuration path.
+        out_dir (str or Path):
+            Root folder to write CSV/JSON outputs into.
+        debug_emotion (bool):
+            If True, prints detailed vibrato/microtiming stats per segment.
+
+    Returns:
+        pathlib.Path: Path to the generated compmap-*.json file.
+
+    explicit_compmap_path (str or Path, optional):
+        If given, compmap JSON will be written exactly to this path
+        instead of the default scoring-*/compmap-*.json.
+    """
+    base_str = str(base)
+    out_dir_str = str(out_dir)
+    cfg_path_str = str(cfg_path)
 
     # Config
-    cfg = _load_cfg(args.cfg)
+    cfg = _load_cfg(cfg_path_str)
     sr_proc = int(cfg.get("sample_rate", 48000))
     sr_f0 = int(cfg.get("f0_sr", 16000))
     alpha = float(alpha_pct) / 100.0
@@ -198,10 +213,11 @@ def main():
     top_k = int(cfg.get("top_k", 3))
 
     # Selection (phrase directory)
-    rel, singer_num, phrase_num = parse_selection(select_str)
+    select_str = str(select)
+    rel, singer_id, phrase_num = parse_selection(select_str)
 
     # Resolve base dir relative to project root if needed
-    base_dir = Path(args.base)
+    base_dir = Path(base_str)
     if not base_dir.is_absolute():
         base_dir = PROJECT_ROOT / base_dir
 
@@ -220,16 +236,16 @@ def main():
     if not wavs:
         raise FileNotFoundError(f"No .wav files in {phrase_dir}")
 
-    phrase_name = f"singer{singer_num}/phrase{phrase_num}"
+    phrase_name = rel
     alpha_int = int(round(alpha * 100))
 
     # Root outputs folder (e.g. <project_root>/outputs)
-    out_root = Path(args.out_dir)
+    out_root = Path(out_dir_str)
     if not out_root.is_absolute():
         out_root = PROJECT_ROOT / out_root
 
     # Phrase/run-specific scoring folder, e.g. outputs/scoring-01-02-60
-    scoring_dir = out_root / f"scoring-{singer_num}-{phrase_num}-{alpha_int}"
+    scoring_dir = out_root / f"scoring-{singer_id}-{phrase_num}-{alpha_int}"
     scoring_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -246,7 +262,7 @@ def main():
 
         # Single phrase per file
         (s0, e0) = one_phrase(y, sr)[0]
-        yph = y[int(s0 * sr) : int(e0 * sr)]
+        yph = y[int(s0 * sr): int(e0 * sr)]
 
         # F0 + periodicity on the 16k signal (whole phrase)
         f0, periodicity = f0_crepe_16k(y_f016, sr16=sr_f0_actual, mask_thresh=0.5)
@@ -298,10 +314,9 @@ def main():
     if not global_rows:
         raise RuntimeError("No takes processed in pass 1—check your input files.")
 
-
-    # Save whole-phrase ranking (like the original script)
+    # Save whole-phrase ranking
     df_whole = pds.DataFrame(global_rows).sort_values("final_score", ascending=False)
-    out_csv_whole = scoring_dir / f"features-{singer_num}-{phrase_num}-{alpha_int}.csv"
+    out_csv_whole = scoring_dir / f"features-{singer_id}-{phrase_num}-{alpha_int}.csv"
     df_whole.to_csv(out_csv_whole, index=False)
 
     print(f"\n[PASS 1] Whole-phrase scores written to {out_csv_whole}")
@@ -345,7 +360,7 @@ def main():
             if e_clamp <= s_clamp:
                 continue
 
-            y_seg = y[int(s_clamp * sr) : int(e_clamp * sr)]
+            y_seg = y[int(s_clamp * sr): int(e_clamp * sr)]
             if len(y_seg) <= 0:
                 continue
 
@@ -389,7 +404,7 @@ def main():
 
             seg_rows.append(row)
 
-            if args.debug_emotion:
+            if debug_emotion:
                 vib_dbg = vibrato_analysis(
                     f0_seg, pd_seg, sr16=take["sr_f0"], hop=256, pd_thresh=0.6
                 )
@@ -414,9 +429,7 @@ def main():
     df_seg = pds.DataFrame(seg_rows)
     df_seg = df_seg.sort_values(["segment_idx", "final_score"], ascending=[True, False])
 
-    out_csv_segments = (
-            scoring_dir / f"segments-{singer_num}-{phrase_num}-{alpha_int}.csv"
-    )
+    out_csv_segments = scoring_dir / f"segments-{singer_id}-{phrase_num}-{alpha_int}.csv"
     df_seg.to_csv(out_csv_segments, index=False)
 
     print(f"\n[PASS 2] Segment-level scores written to {out_csv_segments}")
@@ -473,6 +486,7 @@ def main():
             {
                 "index": int(seg_idx),
                 "start_s": float(best["seg_start_s"]),
+
                 "end_s": float(best["seg_end_s"]),
                 "winner": winner,
                 "candidates": candidates,
@@ -484,17 +498,91 @@ def main():
         "alpha": alpha,
         "alpha_pct": int(round(alpha * 100)),
         "bpm": float(bpm),
-        "base_dir": args.base,
+        "base_dir": base_str,
         "relative_path": rel,
         "reference_take": ref_id,
         "segments": segments_summary,
     }
 
-    out_json = scoring_dir / f"compmap-{singer_num}-{phrase_num}-{alpha_int}.json"
+    # Decide final compmap path
+    if explicit_compmap_path is not None:
+        out_json = Path(explicit_compmap_path)
+        if not out_json.is_absolute():
+            out_json = PROJECT_ROOT / out_json
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_json = scoring_dir / f"compmap-{singer_id}-{phrase_num}-{alpha_int}.json"
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(compmap, f, indent=2)
 
     print(f"\n[COMP MAP] Written comp map JSON to {out_json}\n")
+
+    return out_json
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=(
+            "Extract features for a selected phrase, compute Accuracy/Emotion scores, "
+            "segment the best take, and produce per-segment rankings + comp map. "
+            "If --select/--alpha_pct/--bpm are omitted, you'll be prompted."
+        )
+    )
+    ap.add_argument(
+        "--base",
+        default="data_pilot",
+        help="Base folder containing singer/phrase directories (default: data_pilot)",
+    )
+    ap.add_argument(
+        "--select",
+        default=None,
+        help='Phrase selection, e.g. "singer01/phrase02". If omitted, will prompt.',
+    )
+    ap.add_argument(
+        "--alpha_pct",
+        type=int,
+        default=None,
+        help="Accuracy weight in percent (Emotion gets the rest). If omitted, will prompt.",
+    )
+    ap.add_argument(
+        "--bpm",
+        type=float,
+        default=None,
+        help="Tempo in BPM for this phrase. If omitted, will prompt.",
+    )
+    ap.add_argument(
+        "--cfg",
+        default="configs/weights.yaml",
+        help="YAML with sample_rate, f0_sr, weights, etc.",
+    )
+    ap.add_argument(
+        "--out_dir",
+        default="outputs",
+        help="Folder to write CSV/JSON outputs into",
+    )
+    ap.add_argument(
+        "--debug_emotion",
+        action="store_true",
+        help="Print vibrato/microtiming debug stats per segment",
+    )
+    args = ap.parse_args()
+
+    # Interactive fallback (same behaviour as before)
+    select_str, alpha_pct, bpm = prompt_if_missing(args)
+
+    # Delegate to the programmatic helper
+    run_feature_extraction(
+        base=args.base,
+        select=select_str,
+        alpha_pct=alpha_pct,
+        bpm=bpm,
+        cfg_path=args.cfg,
+        out_dir=args.out_dir,
+        debug_emotion=args.debug_emotion,
+    )
+
 
 
 if __name__ == "__main__":

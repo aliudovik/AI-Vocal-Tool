@@ -1,7 +1,7 @@
 # src/segmentation.py
 # Phrase segmentation helpers.
 #
-# For MVP we:
+# Current approach:
 #   - Use RMS (energy) only to find low-energy valleys.
 #   - Prefer cuts at those valleys so we don't slice sustained vowels.
 #   - Aim for ~2-beat segments (via BPM), but:
