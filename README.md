@@ -20,7 +20,8 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 8. Python magic (segments ranking)
 10. **Export** the comped result
 
-<img width="1920" height="1080" alt="vlcsnap-2025-12-23-23h24m00s325" src="https://github.com/user-attachments/assets/ea4b90c3-9e34-417c-835f-b4689ff5187e" />
+<img width="1920" height="1002" alt="main_interface" src="https://github.com/user-attachments/assets/fcef7313-2801-408b-b6fe-252ad5248bd7" />
+
 
 
 ---
@@ -52,16 +53,53 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 Repository structure:
 
 ```
-/README.md
-/assets/
-  screenshots/
-    main-interface.png
-    segmentation.png
-    recording.png
-    data-collection-app.png
-/src/            # Python pipeline
-/pINTERFACE/src  # JUCE Framework C++ interface
-LICENSE
+AI-Vocal-Comp/
+  README.md
+  LICENSE
+  .gitignore
+  requirements.txt
+
+  JUCE/                         # git submodule (JUCE framework)
+
+  interface/
+    AI-Comp-Interface.jucer
+    Source/
+      Main.cpp
+      MainComponent.cpp
+      MainComponent.h
+      MainComponent_AudioAndRecording.cpp
+      MainComponent_Comping.cpp
+      MainComponent_Interaction.cpp
+      MainComponent_Saving.cpp
+      MainComponent_Views.cpp
+      NeonUI.cpp
+      NeonUI.h
+      ProjectState.cpp
+      ProjectState.h
+
+  python/
+    extract_features.py
+    features.py
+    io.py
+    run_comping.py
+    scoring.py
+    segmentation.py
+    stitch_from_compmap.py
+
+  scripts/
+    apply_ranker.py
+    build_pairs.py
+    train_ranker_sklearn.py
+
+  models/
+    ranker_sklearn.joblib        # optional (use LFS if big)
+
+  assets/
+    screenshots/
+      main_interface.png
+      comping_interface.png
+      wireframe.png
+      data_collection.png
 ```
 
 ---
