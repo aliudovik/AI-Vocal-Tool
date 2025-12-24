@@ -2,7 +2,7 @@
 
 One-button vocal comping app that helps singers record multiple takes on a loop and build a seamless “comp” by selecting the best take per phrase segment — then export the final vocal.
 
-> **Demo / data collection app:** https://vocalcomping.pythonanywhere.com/
+> **Help with data collection:** https://vocalcomping.pythonanywhere.com/
 
 ---
 
@@ -17,12 +17,11 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 5. App **auto-pads + splits** the recording into loop-sized takes
 6. A reference take is **segmented** into musical phrase chunks
 7. The same boundaries are reused across all takes
-8. (Optional) segments are **ranked** to speed selection
-9. **Export** the comped result
+8. Python magic (segments ranking)
+10. **Export** the comped result
 
-[Main interface screenshot goes here: `assets/screenshots/main-interface.png`]
+<img width="1920" height="1080" alt="vlcsnap-2025-12-23-23h24m00s325" src="https://github.com/user-attachments/assets/ea4b90c3-9e34-417c-835f-b4689ff5187e" />
 
-[Segmentation screenshot goes here: `assets/screenshots/segmentation.png`]
 
 ---
 
@@ -47,25 +46,21 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 - **Python toolkit**
   - Feature extraction
   - Segmentation (RMS valleys + BPM-aware target)
-  - Segment scoring / ranking experiments
+  - Segment scoring / ranking; writing to a compmap json
+  - Stitching from the compmap
 
-Suggested repo layout:
+Repository structure:
 
 ```
 /README.md
-/docs/
-  architecture.md
-  segmentation.md
-  dataset.md
-  roadmap.md
 /assets/
   screenshots/
     main-interface.png
     segmentation.png
     recording.png
     data-collection-app.png
-/src/        # C++ app code
-/python/     # segmentation + scoring
+/src/            # Python pipeline
+/pINTERFACE/src  # JUCE Framework C++ interface
 LICENSE
 ```
 
@@ -101,7 +96,7 @@ btime = float(cand[np.argmin(np.abs(cand - (last + target)))])
 boundaries.append(btime); last = btime
 ```
 
-**Why boundaries appear where they do (matches the screenshot):**
+**Why this functionality for boundaries:**
 - Early boundaries align with clear RMS dips between short syllables/phrases.
 - A long middle region stays uncut because the signal remains energetic/continuous (no valid valley in the allowed window).
 - Later pauses create new valleys → new segments.
@@ -139,4 +134,4 @@ Built solo in ~6 weeks part-time, finished (demo) **20 Dec 2025**. I owned end-t
 
 ## License
 
-Add a `LICENSE` file (MIT / Apache-2.0 / GPL, etc.).
+MIT License (see the license section).
