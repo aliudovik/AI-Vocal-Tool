@@ -19,6 +19,9 @@
 
 import argparse
 import json
+import os
+import tempfile
+import time
 from pathlib import Path
 
 from src.extract_features import (
@@ -27,6 +30,36 @@ from src.extract_features import (
     PROJECT_ROOT,
 )
 from src.stitch_from_compmap import stitch_from_compmap
+
+# ----------------------------------------------------------------------
+# Logging to the same file as segmentation
+# ----------------------------------------------------------------------
+
+LOG_PATH = os.environ.get(
+    "AIVOCAL_SEG_LOG",
+    os.path.join(tempfile.gettempdir(), "aivocal_segmentation_debug.log"),
+)
+
+# Make sure env vars are set for segmentation too
+os.environ["AIVOCAL_SEG_DEBUG"] = "1"
+os.environ["AIVOCAL_SEG_TRACE"] = "1"
+os.environ["AIVOCAL_SEG_TRACE_EVERY"] = "10"
+os.environ["AIVOCAL_SEG_TIME_BUDGET"] = "2.0"
+os.environ["AIVOCAL_SEG_LOG"] = LOG_PATH
+
+
+def _plog(msg: str) -> None:
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[PIPE {time.strftime('%H:%M:%S')}] {msg}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+# Touch the log so you know path is correct
+with open(LOG_PATH, "a", encoding="utf-8") as f:
+    f.write("run_comping: started\n")
 
 
 def run_comping(
@@ -39,42 +72,26 @@ def run_comping(
     cfg="configs/weights.yaml",
     out_comped_path=None,
     out_compmap_path=None,
+    use_ml=False,
 ):
     """
     Run the full comping pipeline:
       1) feature extraction + compmap json
       2) stitching into a final comped WAV.
-
-    Args:
-        base_dir (str or Path):
-            Base folder containing singer/phrase directories (e.g. "data_pilot").
-        select (str):
-            Phrase selection, e.g. "singer_user/phrase01".
-        alpha_pct (int):
-            Accuracy weight in percent (0..100). Emotion = 100 - alpha_pct.
-        bpm (float):
-            Tempo in BPM for this phrase.
-        fade_fraction (float):
-            Fraction of the shorter adjacent segment used to derive crossfade
-            length. Passed through to stitch_from_compmap().
-        out_dir (str or Path):
-            Root outputs folder (same as in extract_features.py). Defaults to "outputs".
-        cfg (str or Path):
-            YAML config with sample_rate, weights, etc. Defaults to "configs/weights.yaml".
-        out_comped_path (str or Path, optional):
-            If given, the final comped WAV will be written exactly here.
-        out_compmap_path (str or Path, optional):
-            If given, the compmap JSON will be written exactly here.
-    Returns:
-        pathlib.Path: Path to the final comped WAV file.
     """
     base_str = str(base_dir)
     out_dir_str = str(out_dir)
     cfg_path = str(cfg)
 
+    _plog("=== COMPING START ===")
+    _plog(f"base={base_str} select={select} bpm={bpm} alpha={alpha_pct}")
+
     # ------------------------------------------------------------------
     # 1) Feature extraction + compmap generation (no interactive prompts)
     # ------------------------------------------------------------------
+    _plog("run_feature_extraction: START")
+
+    t0 = time.time()
     compmap_path = run_feature_extraction(
         base=base_str,
         select=select,
@@ -84,9 +101,16 @@ def run_comping(
         out_dir=out_dir_str,
         debug_emotion=False,
         explicit_compmap_path=out_compmap_path,
+        fade_fraction=float(fade_fraction),
+        use_ml=use_ml,
     )
-    compmap_path = Path(compmap_path)
+    t1 = time.time()
 
+    compmap_path = Path(compmap_path)
+    _plog(
+        f"run_feature_extraction: END elapsed={t1 - t0:.3f}s "
+        f"compmap={compmap_path}"
+    )
 
     # ------------------------------------------------------------------
     # 2) Decide output WAV name using singer/phrase/alpha from compmap
@@ -117,10 +141,12 @@ def run_comping(
         # Example fallback: outputs/comped-user-01-60.wav
         out_wav = out_root / f"comped-{singer_id}-{phrase_num}-{alpha_int}.wav"
 
-
     # ------------------------------------------------------------------
     # 3) Stitch using the generated compmap
     # ------------------------------------------------------------------
+    _plog("stitch_from_compmap: START")
+    t2 = time.time()
+
     stitch_from_compmap(
         compmap_path=compmap_path,
         out_path=out_wav,
@@ -129,12 +155,19 @@ def run_comping(
         verbose=True,
     )
 
+    t3 = time.time()
+    _plog(
+        f"stitch_from_compmap: END elapsed={t3 - t2:.3f}s out={out_wav}"
+    )
+    _plog("=== COMPING END ===")
+
     return out_wav
 
 
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
+
 
 def _parse_args():
     p = argparse.ArgumentParser(
@@ -195,6 +228,11 @@ def _parse_args():
         default=None,
         help="Optional explicit path for the compmap JSON.",
     )
+    p.add_argument(
+        "--use_ml",
+        action="store_true",
+        help="Use ML server for emotion scoring.",
+    )
     return p.parse_args()
 
 
@@ -210,6 +248,6 @@ if __name__ == "__main__":
         cfg=args.cfg,
         out_comped_path=args.out_comped_path,
         out_compmap_path=args.out_compmap_path,
+        use_ml=args.use_ml
     )
     print(f"\n[RUN COMPING] Wrote final comped file to: {out_path}\n")
-

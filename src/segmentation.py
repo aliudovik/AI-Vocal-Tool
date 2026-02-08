@@ -1,19 +1,72 @@
 # src/segmentation.py
-# Phrase segmentation helpers.
 #
-# Current approach:
-#   - Use RMS (energy) only to find low-energy valleys.
-#   - Prefer cuts at those valleys so we don't slice sustained vowels.
-#   - Aim for ~2-beat segments (via BPM), but:
-#       * enforce a minimum duration (so we don't get tiny segments),
-#       * use a soft max (~5 s), but allow longer if there are no good valleys.
+# Segmentation (vowel-safe) + guaranteed debug logging.
 #
-# The best overall take (chosen in extract_features.py) defines the
-# "master" segment grid; all other takes are cut at the same times.
+# This version ALWAYS writes a log file, even if env vars are not set.
+# Default log location (Windows): %TEMP%\aivocal_segmentation_debug.log
+#
+# Optional env overrides:
+#   AIVOCAL_SEG_LOG         -> full path to log file
+#   AIVOCAL_SEG_TRACE       -> "1" enables periodic traceback dumps
+#   AIVOCAL_SEG_TRACE_EVERY -> seconds (default 10)
+#   AIVOCAL_SEG_TIME_BUDGET -> DP budget seconds (default 2.0)
+#
+# NOTE: Logging is flushed on every write.
 
+import os
+import tempfile
+import time
 import numpy as np
 import librosa
+import faulthandler
 
+
+debug_emotion = False
+
+# ----------------------------
+# Guaranteed logging
+# ----------------------------
+
+def _default_log_path():
+    # Always writable for the current user.
+    return os.path.join(tempfile.gettempdir(), "aivocal_segmentation_debug.log")
+
+
+def _get_cfg():
+    log_path = os.getenv("AIVOCAL_SEG_LOG", _default_log_path())
+    trace = os.getenv("AIVOCAL_SEG_TRACE", "0") == "1"
+    trace_every = int(os.getenv("AIVOCAL_SEG_TRACE_EVERY", "10"))
+    time_budget = float(os.getenv("AIVOCAL_SEG_TIME_BUDGET", "2.0"))
+    return log_path, trace, trace_every, time_budget
+
+
+def _open_log():
+    log_path, _, _, _ = _get_cfg()
+    try:
+        # ensure parent exists if a custom path is used
+        parent = os.path.dirname(log_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        # line-buffered file (still explicitly flushed in _log)
+        return open(log_path, "a", encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _log(fh, msg: str):
+    if fh is None:
+        return
+    try:
+        ts = time.strftime("%H:%M:%S")
+        fh.write(f"[{ts}] {msg.rstrip()}\n")
+        fh.flush()
+    except Exception:
+        pass
+
+
+# ----------------------------
+# Original helpers
+# ----------------------------
 
 def one_phrase(y, sr):
     """Fallback: treat whole file as one phrase."""
@@ -27,72 +80,238 @@ def _rms_envelope(y, sr, hop=512):
     return rms.astype(np.float32), times.astype(np.float32)
 
 
-def _find_rms_valleys(rms, times, min_spacing=0.18):
+def _smooth_1d(x, win):
+    if win is None or win <= 1:
+        return x.astype(np.float32)
+    win = int(win)
+    k = np.ones(win, dtype=np.float32) / float(win)
+    return np.convolve(x.astype(np.float32), k, mode="same").astype(np.float32)
+
+
+def _find_rms_valleys(
+    rms,
+    times,
+    min_spacing=0.18,
+    valley_percentile=35.0,
+    quiet_cap=0.75,
+    smooth_win=7,
+):
     """
-    Find candidate valley times from RMS:
-      - local minima,
-      - below a global "quiet" threshold (percentile-based),
-      - de-duplicated so we don't get tons of very close valleys.
+    Returns:
+        valley_times: np.ndarray [K]
+        valley_rms:   np.ndarray [K]  (normalized/smoothed RMS at valley; lower = quieter)
     """
     n = len(rms)
     if n < 3:
-        return np.zeros(0, dtype=np.float32)
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
 
-    # Normalize RMS to [0,1]
     max_r = float(rms.max())
-    if max_r > 0:
-        rms_norm = rms / max_r
-    else:
-        rms_norm = rms.copy()
+    rms_norm = (rms / max_r) if max_r > 0 else rms.astype(np.float32)
 
     dur = float(times[-1]) if len(times) > 0 else 0.0
+    env = _smooth_1d(rms_norm, smooth_win)
 
-    # Global "quiet" threshold: below this => considered a dip/valley candidate.
-    # 25th percentile usually picks the quieter inter-word gaps.
-    quiet_thresh = float(np.percentile(rms_norm, 25))
-    # Don't let the threshold be too high (or everything becomes a valley).
-    quiet_thresh = min(quiet_thresh, 0.6)
+    quiet_thresh = float(np.percentile(env, float(valley_percentile)))
+    quiet_thresh = min(quiet_thresh, float(quiet_cap))
 
     valley_idxs = []
     for i in range(1, n - 1):
-        t = times[i]
-        # Avoid extreme edges
+        t = float(times[i])
         if t < 0.03 or t > dur - 0.03:
             continue
 
-        r = rms_norm[i]
+        r = float(env[i])
         if r > quiet_thresh:
             continue
 
-        # Local minimum condition
-        if r <= rms_norm[i - 1] and r <= rms_norm[i + 1]:
+        if r <= float(env[i - 1]) and r <= float(env[i + 1]):
             valley_idxs.append(i)
 
     if not valley_idxs:
-        return np.zeros(0, dtype=np.float32)
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
 
-    # De-duplicate valleys that are too close: keep the lowest one in each cluster
+    # De-duplicate close valleys: keep lowest RMS in each cluster
     keep_times = []
-    keep_rms = []
+    keep_vals = []
     for idx in valley_idxs:
         t = float(times[idx])
-        r = float(rms_norm[idx])
+        r = float(env[idx])
 
         if not keep_times:
             keep_times.append(t)
-            keep_rms.append(r)
+            keep_vals.append(r)
             continue
 
-        if t - keep_times[-1] < min_spacing:
-            # If this new valley is lower (quieter), replace the previous one.
-            if r < keep_rms[-1]:
+        if t - keep_times[-1] < float(min_spacing):
+            if r < keep_vals[-1]:
                 keep_times[-1] = t
-                keep_rms[-1] = r
+                keep_vals[-1] = r
         else:
             keep_times.append(t)
-            keep_rms.append(r)
+            keep_vals.append(r)
 
-    return np.asarray(keep_times, dtype=np.float32)
+    return np.asarray(keep_times, dtype=np.float32), np.asarray(keep_vals, dtype=np.float32)
+
+
+def _choose_boundaries_greedy(
+    valley_times,
+    dur,
+    min_seg_dur,
+    target_seg_dur,
+    max_seg_dur,
+):
+    """Fast fallback: window + closest-to-target valley."""
+    if valley_times.size == 0:
+        return [0.0, float(dur)]
+
+    boundaries = [0.0]
+    last = 0.0
+
+    while True:
+        window_start = last + float(min_seg_dur)
+        if float(dur) - window_start < float(min_seg_dur):
+            break
+
+        window_end = min(last + float(max_seg_dur), float(dur) - float(min_seg_dur))
+        if window_end <= window_start:
+            break
+
+        mask = (valley_times >= window_start) & (valley_times <= window_end)
+        if not np.any(mask):
+            break
+
+        cand = valley_times[mask]
+        desired = last + float(target_seg_dur)
+        idx = int(np.argmin(np.abs(cand - desired)))
+        btime = float(cand[idx])
+
+        if btime - last < float(min_seg_dur):
+            break
+
+        boundaries.append(btime)
+        last = btime
+
+    if float(dur) - boundaries[-1] >= 0.2:
+        boundaries.append(float(dur))
+
+    return boundaries
+
+
+def _choose_boundaries_dp(
+    cand_times,
+    cand_valley_rms,
+    min_seg_dur,
+    target_seg_dur,
+    max_seg_dur,
+    *,
+    max_edge_dur=None,
+    w_over=1.10,
+    w_under=0.65,
+    w_long=7.50,
+    w_boundary=0.08,
+    w_valley=1.10,
+    time_budget_sec=2.0,
+    debug_fh=None,
+):
+    """
+    DP boundary chooser with:
+      - bounded transitions (prevents O(n^2) blowups)
+      - time budget (fallback if exceeded)
+      - periodic progress logging
+    """
+    n = len(cand_times)
+    if n < 2:
+        return [0.0, float(cand_times[-1])]
+
+    if max_edge_dur is None:
+        max_edge_dur = max(float(max_seg_dur) + 0.75 * float(target_seg_dur), 8.0)
+    max_edge_dur = float(max_edge_dur)
+
+    dp = np.full(n, np.inf, dtype=np.float64)
+    prev = np.full(n, -1, dtype=np.int32)
+    dp[0] = 0.0
+
+    t0 = time.time()
+    last_heartbeat = t0
+
+    for j in range(1, n):
+        if (time.time() - t0) > float(time_budget_sec):
+            _log(debug_fh, f"DP budget hit ({time_budget_sec:.2f}s) -> abort DP")
+            return None
+
+        now = time.time()
+        if (now - last_heartbeat) > 0.5:
+            _log(debug_fh, f"DP progress j={j}/{n} t={float(cand_times[j]):.3f}s")
+            last_heartbeat = now
+
+        tj = float(cand_times[j])
+
+        # bounded scan backwards; break once internal edge too long
+        for i in range(j - 1, -1, -1):
+            ti = float(cand_times[i])
+            L = tj - ti
+
+            if L < float(min_seg_dur):
+                continue
+
+            if j != (n - 1) and L > max_edge_dur:
+                break
+
+            over = max(0.0, L - float(target_seg_dur))
+            under = max(0.0, float(target_seg_dur) - L)
+            len_cost = float(w_over) * (over * over) + float(w_under) * (under * under)
+
+            long_over = max(0.0, L - float(max_seg_dur))
+            long_cost = float(w_long) * (long_over * long_over)
+
+            if j == n - 1:
+                b_cost = 0.0
+            else:
+                r = float(cand_valley_rms[j])  # 0=quiet good, 1=loud bad
+                b_cost = float(w_boundary) + float(w_valley) * r
+
+            cost = dp[i] + len_cost + long_cost + b_cost
+            if cost < dp[j]:
+                dp[j] = cost
+                prev[j] = i
+
+        # if unreachable due to bounds, allow unbounded fallback for this j
+        if prev[j] == -1:
+            for i in range(j - 1, -1, -1):
+                ti = float(cand_times[i])
+                L = tj - ti
+                if L < float(min_seg_dur):
+                    continue
+
+                over = max(0.0, L - float(target_seg_dur))
+                under = max(0.0, float(target_seg_dur) - L)
+                len_cost = float(w_over) * (over * over) + float(w_under) * (under * under)
+
+                long_over = max(0.0, L - float(max_seg_dur))
+                long_cost = float(w_long) * (long_over * long_over)
+
+                if j == n - 1:
+                    b_cost = 0.0
+                else:
+                    r = float(cand_valley_rms[j])
+                    b_cost = float(w_boundary) + float(w_valley) * r
+
+                cost = dp[i] + len_cost + long_cost + b_cost
+                if cost < dp[j]:
+                    dp[j] = cost
+                    prev[j] = i
+
+    if prev[n - 1] == -1:
+        return [float(cand_times[0]), float(cand_times[-1])]
+
+    # reconstruct
+    idx = n - 1
+    chosen = []
+    while idx != -1:
+        chosen.append(float(cand_times[idx]))
+        idx = int(prev[idx])
+    chosen.reverse()
+    return chosen
 
 
 def segment_phrase_reference(
@@ -105,108 +324,140 @@ def segment_phrase_reference(
     """
     Segment a reference take into sub-phrase chunks.
 
-    Design goals:
-      - Boundaries must fall at low-energy valleys (between words/syllables),
-        so we avoid splitting long continuous vowels.
-      - Typical segments should be around ~2 beats (BPM-based).
-      - Minimum segment duration ~0.45 s (~2 short words).
-      - Soft maximum segment duration ~5 s, but if there are no good valleys
-        (long continuous singing on one word), we allow longer segments.
-
-    Args:
-      y (np.ndarray): mono waveform.
-      sr (int): sample rate.
-      bpm (float): user-provided tempo in BPM.
-      min_seg_dur (float): minimum segment length in seconds.
-      max_seg_dur (float): "soft" maximum segment length in seconds.
-
     Returns:
-      list[(start_s, end_s)] in seconds.
+        list[(start_s, end_s)] in seconds.
     """
-    dur = len(y) / float(sr)
-    if dur <= 2 * min_seg_dur:
-        # Phrase too short to meaningfully segment
-        return one_phrase(y, sr)
+    log_path, trace, trace_every, time_budget = _get_cfg()
+    fh = _open_log()
+    t_all0 = time.time()
 
-    hop = 512
-    rms, rms_times = _rms_envelope(y, sr, hop=hop)
+    _log(fh, "------------------------------")
+    _log(fh, f"segment start log_path={log_path}")
+    _log(fh, f"sr={sr} bpm={bpm} len(y)={len(y)}")
 
-    # Detect RMS valleys once; we will pick among these.
-    valley_times = _find_rms_valleys(rms, rms_times, min_spacing=0.18)
+    try:
+        if trace and fh is not None:
+            try:
+                faulthandler.dump_traceback_later(int(trace_every), repeat=True, file=fh)
+                _log(fh, f"faulthandler enabled every {int(trace_every)}s")
+            except Exception as e:
+                _log(fh, f"faulthandler enable failed: {repr(e)}")
 
-    # Target duration: about 2 beats, but clamped to reasonable bounds.
-    if bpm is not None and bpm > 0:
-        beat_period = 60.0 / float(bpm)
-        target_seg_dur = max(min_seg_dur, min(4.0, 2.0 * beat_period))
-    else:
-        target_seg_dur = 1.2  # generic fallback ~ spoken phrase chunk
+        dur = len(y) / float(sr)
+        _log(fh, f"dur={dur:.3f}s")
 
-    # If there are no valleys at all, either the phrase is very compressed/flat
-    # or it's continuous singing. In that case, don't force cuts.
-    if valley_times.size == 0:
-        return [(0.0, dur)]
+        if dur <= 2 * float(min_seg_dur):
+            _log(fh, "too short -> one phrase")
+            return one_phrase(y, sr)
 
-    boundaries = [0.0]
-    last = 0.0
+        hop = 512
+        rms, rms_times = _rms_envelope(y, sr, hop=hop)
+        _log(fh, f"rms_frames={len(rms)} hop={hop}")
 
-    # Iterate forward through the phrase, placing cuts where:
-    #   - we are at least min_seg_dur from the last boundary,
-    #   - there's a valley in [last + min_seg_dur, last + max_seg_dur].
-    while True:
-        # Earliest we are allowed to cut
-        window_start = last + min_seg_dur
-        # If there isn't enough room left for another min segment, stop.
-        if dur - window_start < min_seg_dur:
-            break
-
-        # Latest we'd *like* to cut (soft max). Keep some room for the tail.
-        window_end = min(last + max_seg_dur, dur - min_seg_dur)
-        if window_end <= window_start:
-            break
-
-        # Candidate valleys inside this window
-        mask = (valley_times >= window_start) & (valley_times <= window_end)
-        if not np.any(mask):
-            # No good valley in this window: don't force an arbitrary cut.
-            # We'll leave the remainder as one longer segment.
-            break
-
-        cand = valley_times[mask]
-        desired = last + target_seg_dur
-
-        # Pick the valley closest to the desired time
-        idx = int(np.argmin(np.abs(cand - desired)))
-        btime = float(cand[idx])
-
-        # Safety: ensure progress and minimum duration
-        if btime - last < min_seg_dur:
-            # If we somehow got an invalid boundary, stop to avoid infinite loop.
-            break
-
-        boundaries.append(btime)
-        last = btime
-
-    # Always close at phrase end
-    if dur - boundaries[-1] >= 0.2:  # tiny tail (<200 ms) is ignored
-        boundaries.append(dur)
-
-    # Build (start, end) segments and merge any tiny leftovers defensively
-    merged = []
-    for s, e in zip(boundaries[:-1], boundaries[1:]):
-        if not merged:
-            merged.append([s, e])
-            continue
-
-        seg_len = e - s
-        if seg_len < min_seg_dur:
-            # Merge too-short segment with previous one
-            merged[-1][1] = e
+        if bpm is not None and bpm > 0:
+            beat_period = 60.0 / float(bpm)
+            eff_min_seg_dur = min(float(min_seg_dur), max(0.25, 0.90 * beat_period))
+            target_seg_dur = max(eff_min_seg_dur, min(4.0, 2.0 * beat_period))
+            valley_min_spacing = min(0.18, 0.40 * beat_period)
         else:
-            merged.append([s, e])
+            eff_min_seg_dur = float(min_seg_dur)
+            target_seg_dur = 1.2
+            valley_min_spacing = 0.18
 
-    segments = [(float(s), float(e)) for (s, e) in merged if (e - s) > 1e-3]
+        _log(
+            fh,
+            f"params eff_min_seg_dur={eff_min_seg_dur:.3f} target_seg_dur={target_seg_dur:.3f} "
+            f"max_seg_dur={float(max_seg_dur):.3f} valley_min_spacing={valley_min_spacing:.3f} "
+            f"dp_budget={float(time_budget):.2f}s",
+        )
 
-    if not segments:
-        return one_phrase(y, sr)
+        valley_times, valley_vals = _find_rms_valleys(
+            rms,
+            rms_times,
+            min_spacing=valley_min_spacing,
+            valley_percentile=35.0,
+            quiet_cap=0.75,
+            smooth_win=7,
+        )
+        _log(fh, f"valleys={int(valley_times.size)}")
 
-    return segments
+        if valley_times.size == 0:
+            _log(fh, "no valleys -> one segment")
+            return [(0.0, dur)]
+
+        cand_times = np.concatenate(
+            [np.asarray([0.0], dtype=np.float32), valley_times, np.asarray([dur], dtype=np.float32)]
+        )
+        cand_vals = np.concatenate(
+            [np.asarray([1.0], dtype=np.float32), valley_vals, np.asarray([1.0], dtype=np.float32)]
+        )
+        _log(fh, f"candidates={len(cand_times)}")
+
+        boundaries = _choose_boundaries_dp(
+            cand_times=cand_times,
+            cand_valley_rms=cand_vals,
+            min_seg_dur=eff_min_seg_dur,
+            target_seg_dur=target_seg_dur,
+            max_seg_dur=float(max_seg_dur),
+            max_edge_dur=max(float(max_seg_dur) + 0.75 * float(target_seg_dur), 8.0),
+            time_budget_sec=float(time_budget),
+            debug_fh=fh,
+        )
+
+        if boundaries is None:
+            _log(fh, "dp aborted -> greedy fallback")
+            boundaries = _choose_boundaries_greedy(
+                valley_times=valley_times,
+                dur=dur,
+                min_seg_dur=eff_min_seg_dur,
+                target_seg_dur=target_seg_dur,
+                max_seg_dur=float(max_seg_dur),
+            )
+
+        if boundaries[-1] < dur - 1e-3:
+            boundaries.append(float(dur))
+
+        _log(fh, f"boundaries={len(boundaries)} first={boundaries[0]:.3f} last={boundaries[-1]:.3f}")
+
+        merged = []
+        for s, e in zip(boundaries[:-1], boundaries[1:]):
+            if not merged:
+                merged.append([float(s), float(e)])
+                continue
+
+            seg_len = float(e) - float(s)
+            if seg_len < float(eff_min_seg_dur):
+                merged[-1][1] = float(e)
+            else:
+                merged.append([float(s), float(e)])
+
+        segments = [(float(s), float(e)) for (s, e) in merged if (float(e) - float(s)) > 1e-3]
+        _log(fh, f"segments={len(segments)} elapsed={(time.time() - t_all0):.3f}s")
+
+        if not segments:
+            _log(fh, "no segments after merge -> one phrase")
+            return one_phrase(y, sr)
+
+        # UI SPEED CAP: high BPM makes too many segments -> slow JUCE comp tab render
+        if bpm and bpm > 140 and len(segments) > 8:
+            _log(fh, f"UI cap: {len(segments)} segs -> 8 (bpm={bpm})")
+            segments = segments[:8]
+            segments[-1] = (segments[-1][0], dur)  # extend last to phrase end
+
+        t_all1 = time.time()
+        _log(fh, f"done: segments={len(segments)} elapsed={(t_all1 - t_all0):.3f}s")
+
+        return segments
+
+
+    finally:
+        if trace:
+            try:
+                faulthandler.cancel_dump_traceback_later()
+            except Exception:
+                pass
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass

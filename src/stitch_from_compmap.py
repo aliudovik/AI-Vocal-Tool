@@ -22,12 +22,18 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from src.io import load_wav
+from src.io import load_wav # src there
+
+
+from src.compmap_utils import compute_default_boundaries, validate_or_none # src there
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 PER_TAKE_NORMALIZE_DBFS = -3.0 # we need per take normalization, different segment volume bugs otherwise....
+
+debug_emotion = False
+
 
 def _load_compmap(path):
     """Load compmap JSON (resolve relative to project root if needed)."""
@@ -145,12 +151,43 @@ def _peak_normalize(x, target_dbfs=-1.0):
     return (x * gain).astype(np.float32)
 
 
+def _compute_crossfade_weights(length, curve="linear"):
+    """
+    Compute crossfade weight arrays for prev and next takes.
+
+    Args:
+        length: number of samples in crossfade window
+        curve: "linear" or "equal_power"
+
+    Returns:
+        (w_prev, w_next): numpy arrays of shape (length,) summing to 1.0
+    """
+    if length <= 0:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    t = np.linspace(0.0, 1.0, length, dtype=np.float32)
+
+    if curve == "equal_power":
+        # Equal-power crossfade: sin/cos curves that preserve energy
+        # prev: cos(t * π/2)  (1 -> 0)
+        # next: sin(t * π/2)  (0 -> 1)
+        w_prev = np.cos(t * np.pi / 2.0)
+        w_next = np.sin(t * np.pi / 2.0)
+    else:
+        # Linear crossfade (default)
+        w_next = t
+        w_prev = 1.0 - t
+
+    return w_prev.astype(np.float32), w_next.astype(np.float32)
+
+
 def stitch_from_compmap(
     compmap_path,
     out_path,
     fade_fraction=0.15,
     base_override=None,
-    verbose=True,
+    verbose=False,
+    xfade_curve="linear"
 ):
     """
     Main stitching routine.
@@ -162,6 +199,8 @@ def stitch_from_compmap(
          used to derive crossfade length, clamped between 30 ms and 500 ms.
       base_override (str or None): override compmap["base_dir"] if provided.
       verbose (bool): print what is being stitched.
+      xfade_curve (str): "linear" (default) or "equal_power".
+
     """
     compmap = _load_compmap(compmap_path)
     phrase = compmap.get("phrase", "")
@@ -171,6 +210,20 @@ def stitch_from_compmap(
         raise RuntimeError("Compmap has no segments.")
 
     sr, audio = _load_winner_audio(compmap, base_override=base_override)
+
+    # Normalize/validate curve name (keep linear default for minimal risk)
+    curve = (xfade_curve or "linear").strip().lower()
+    if curve in ("equalpower", "equal_power", "equal-power", "ep"):
+        curve = "equal_power"
+    elif curve in ("linear", "lin"):
+        curve = "linear"
+    else:
+        raise ValueError(
+            f"Unsupported xfade_curve={curve!r}. Use 'linear' or 'equal_power'."
+        )
+
+
+
 
     # Sort segments by time
     segments_sorted = sorted(segments, key=lambda s: s["start_s"])
@@ -230,39 +283,38 @@ def stitch_from_compmap(
         out_wave[start_sample:end_sample] = seg_wave.astype(np.float32)
 
     # Step 2: apply time-aligned crossfades around boundaries
-    # We work per-boundary, mixing the two relevant takes in a window
-    # centered on the boundary, without changing the overall timeline length.
-    min_fade_s = 0.030  # 30 ms
-    max_fade_s = 0.500  # 500 ms
+    # Use explicit compmap boundaries if present/valid, otherwise compute defaults at runtime.
+    boundaries = validate_or_none(segments_sorted, compmap.get("boundaries", None))
+    if boundaries is None:
+        boundaries = compute_default_boundaries(segments_sorted, fade_fraction)
 
     for b in range(num_segs - 1):
-        # Boundary time in seconds
-        boundary_s = end_s[b]
-        # Adjacent segment durations
-        d1 = dur_s[b]
-        d2 = dur_s[b + 1]
-        base_dur_s = min(d1, d2)
+        seg_l = segments_sorted[b]
+        seg_r = segments_sorted[b + 1]
 
-        if base_dur_s <= 0.0 or fade_fraction <= 0.0:
+        boundary_s = float(end_s[b])
+        xfade_start_s = float(boundaries[b]["xfadeStartSec"])
+        xfade_end_s = float(boundaries[b]["xfadeEndSec"])
+
+        # Safety constraints: clamp crossfade window to segment bounds
+        # Left edge must not go earlier than left segment start
+        xfade_start_s = max(float(seg_l["start_s"]), xfade_start_s)
+        # Right edge must not go later than right segment end
+        xfade_end_s = min(float(seg_r["end_s"]), xfade_end_s)
+        # Also clamp to boundary (crossfade start must be <= boundary <= crossfade end)
+        xfade_start_s = min(xfade_start_s, boundary_s)
+        xfade_end_s = max(xfade_end_s, boundary_s)
+
+        # Disabled/empty window => skip crossfade
+        if xfade_end_s <= xfade_start_s:
+            if verbose:
+                print(
+                    f"Boundary {b}: skipping crossfade (window collapsed to zero)"
+                )
             continue
 
-        # Desired fade duration
-        fade_s_desired = base_dur_s * fade_fraction
-        # Clamp: at least 30 ms, at most 500 ms, and not longer than d1 + d2
-        fade_s = max(min_fade_s, fade_s_desired)
-        fade_s = min(fade_s, max_fade_s, d1 + d2)
-
-        if fade_s <= 0.0:
-            continue
-
-        half_s = fade_s / 2.0
-
-        # Crossfade region [boundary - half, boundary + half]
-        start_s_cf = boundary_s - half_s
-        end_s_cf = boundary_s + half_s
-
-        start_sample_cf = int(round(start_s_cf * sr))
-        end_sample_cf = int(round(end_s_cf * sr))
+        start_sample_cf = int(round(xfade_start_s * sr))
+        end_sample_cf = int(round(xfade_end_s * sr))
 
         # Clamp to buffer
         start_sample_cf = max(0, min(start_sample_cf, target_samples))
@@ -270,24 +322,32 @@ def stitch_from_compmap(
 
         length_cf = end_sample_cf - start_sample_cf
         if length_cf <= 1:
+            if verbose:
+                print(
+                    f"Boundary {b}: skipping crossfade (window too short: {length_cf} samples)"
+                )
             continue
 
         prev_take_id = take_ids[b]
         next_take_id = take_ids[b + 1]
-
         y_prev = audio[prev_take_id]
         y_next = audio[next_take_id]
 
         # Clamp to available samples in each take
         end_sample_cf_prev = min(end_sample_cf, y_prev.size)
         end_sample_cf_next = min(end_sample_cf, y_next.size)
-        # Adjust length if needed (should be the same for both)
+
+        # Adjust length if needed
         length_cf = min(
             length_cf,
             end_sample_cf_prev - start_sample_cf,
             end_sample_cf_next - start_sample_cf,
         )
         if length_cf <= 1:
+            if verbose:
+                print(
+                    f"Boundary {b}: skipping crossfade (insufficient audio in takes)"
+                )
             continue
 
         end_sample_cf = start_sample_cf + length_cf
@@ -295,10 +355,8 @@ def stitch_from_compmap(
         prev_slice = y_prev[start_sample_cf:end_sample_cf].astype(np.float32)
         next_slice = y_next[start_sample_cf:end_sample_cf].astype(np.float32)
 
-        # Linear crossfade weights across the region
-        t = np.linspace(0.0, 1.0, length_cf, dtype=np.float32)
-        w_next = t          # 0 -> 1
-        w_prev = 1.0 - t    # 1 -> 0
+        # Compute crossfade weights using selected curve
+        w_prev, w_next = _compute_crossfade_weights(length_cf, curve=curve)
 
         cross = prev_slice * w_prev + next_slice * w_next
 
@@ -308,10 +366,10 @@ def stitch_from_compmap(
         if verbose:
             dur_cf = length_cf / float(sr)
             print(
-                f"Boundary between seg {segments_sorted[b]['index']:02d} "
-                f"and {segments_sorted[b+1]['index']:02d}: "
-                f"crossfade {fade_s*1000.0:5.1f} ms "
-                f"around {boundary_s:7.3f}s (actual {dur_cf*1000.0:5.1f} ms)"
+                f"Boundary between seg {seg_l['index']:02d} "
+                f"and {seg_r['index']:02d}: "
+                f"crossfade [{xfade_start_s:.3f}, {xfade_end_s:.3f}]s "
+                f"({dur_cf * 1000.0:.1f} ms, {curve} curve)"
             )
 
     if out_wave.size == 0:
@@ -373,7 +431,8 @@ def main():
         out_path=out_path,
         fade_fraction=fade_fraction,
         base_override=None,
-        verbose=True,
+        verbose=False,
+        xfade_curve="linear",  # x fade curve
     )
 
 

@@ -44,8 +44,28 @@ from src.features import (
     microtiming_analysis,
 )
 from src.scoring import norm_block, accuracy_score, emotion_score, final_blend
+from src.compmap_utils import compute_default_boundaries
+import requests
+import opensmile
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# --- ML CONFIG ---
+# Initialize OpenSMILE once to avoid lag per segment
+
+_SMILE_EXTRACTOR = None
+
+def _get_smile():
+    global _SMILE_EXTRACTOR
+    if _SMILE_EXTRACTOR is None:
+        import opensmile
+        _SMILE_EXTRACTOR = opensmile.Smile(
+            feature_set=opensmile.FeatureSet.ComParE_2016,
+            feature_level=opensmile.FeatureLevel.Functionals,
+        )
+    return _SMILE_EXTRACTOR
+ML_SERVER_URL = "http://127.0.0.1:7437/predict_emotion"
 
 
 def parse_selection(sel):
@@ -163,7 +183,10 @@ def run_feature_extraction(
     out_dir="outputs",
     debug_emotion=False,
     explicit_compmap_path=None,
+    fade_fraction=0.15,
+    use_ml=False,
 ):
+
 
     """
     Programmatic entry point for feature extraction + comp map generation.
@@ -229,7 +252,7 @@ def run_feature_extraction(
     wavs = sorted(
         [
             p.as_posix()
-            for p in phrase_dir.glob("*.wav")
+            for p in phrase_dir.glob("take_*.wav")
             if p.suffix.lower() == ".wav"
         ]
     )
@@ -284,13 +307,52 @@ def run_feature_extraction(
         n = norm_block(row)
         row["acc_score"] = accuracy_score(n, weights=weights_acc)
 
-        # Emotion-side features (whole phrase)
-        row["vibrato_stability"] = vibrato_stability(
-            f0, periodicity, sr16=sr_f0_actual, hop=256, pd_thresh=0.6
-        )
-        row["dyn_shape"] = dyn_shape(yph, sr)
-        row["microtiming"] = microtiming(yph, sr)
-        row["emo_score"] = emotion_score(row, weights=weights_emo)
+        ml_success = False
+
+        if use_ml:
+
+            try:
+                # 1. Extract 88 Features via OpenSMILE
+                # process_signal returns a DataFrame. We use the raw numpy array y_seg.
+                feat_df = _get_smile().process_signal(yph, sr)
+
+                if not feat_df.empty:
+                    # 2. Send to Server
+                    feats_list = feat_df.iloc[0].astype(float).tolist()
+                    payload = {"features": feats_list}
+
+                    resp = requests.post(ML_SERVER_URL, json=payload, timeout=3.7)
+
+                    if resp.status_code == 200:
+                        data = resp.json()
+
+                        # --- NEW: Print the server message to logs ---
+                        msg = data.get("message", "No message")
+                        print(f"[SERVER REPLY] {msg}")
+                        # ---------------------------------------------
+
+                        # Map 0.0-1.0 to 0-100 score
+                        row["emo_score"] = float(data.get("emotion_score", 0.0)) * 100.0
+
+                        # Fill dummies
+                        row["vibrato_stability"] = -1.0
+                        row["dyn_shape"] = -1.0
+                        row["microtiming"] = -1.0
+                        ml_success = True
+                    else:
+                        print(f"[ML FAIL] Server returned {resp.status_code}")
+            except Exception as e:
+                print(f"[ML ERR] Connection failed: {e}")
+
+        if not ml_success:
+
+            # Emotion-side features (whole phrase)
+            row["vibrato_stability"] = vibrato_stability(
+                f0, periodicity, sr16=sr_f0_actual, hop=256, pd_thresh=0.6
+            )
+            row["dyn_shape"] = dyn_shape(yph, sr)
+            row["microtiming"] = microtiming(yph, sr)
+            row["emo_score"] = emotion_score(row, weights=weights_emo)
 
         row["alpha"] = alpha
         row["final_score"] = final_blend(row["acc_score"], row["emo_score"], alpha)
@@ -318,9 +380,9 @@ def run_feature_extraction(
     df_whole = pds.DataFrame(global_rows).sort_values("final_score", ascending=False)
     out_csv_whole = scoring_dir / f"features-{singer_id}-{phrase_num}-{alpha_int}.csv"
     df_whole.to_csv(out_csv_whole, index=False)
-
-    print(f"\n[PASS 1] Whole-phrase scores written to {out_csv_whole}")
-    print(df_whole[["phrase", "take", "acc_score", "emo_score", "final_score"]].head(10))
+    if debug_emotion:
+        print(f"\n[PASS 1] Whole-phrase scores written to {out_csv_whole}")
+        print(df_whole[["phrase", "take", "acc_score", "emo_score", "final_score"]].head(10))
 
     # ------------------------------------------------------------------
     # PASS 2: Segment reference (best take) and then score each segment.
@@ -330,15 +392,17 @@ def run_feature_extraction(
     best_idx = int(np.argmax([r["final_score"] for r in global_rows]))
     ref_take = takes[best_idx]
     ref_id = ref_take["take_id"]
-
-    print(f"\n[PASS 2] Using take '{ref_id}' as reference for segmentation.")
+    if debug_emotion:
+        print(f"\n[PASS 2] Using take '{ref_id}' as reference for segmentation.")
 
     ref_y = ref_take["y"]
     ref_sr = ref_take["sr"]
 
     # Segment the reference take
     segments = segment_phrase_reference(ref_y, ref_sr, bpm=bpm)
-    print(f"[PASS 2] Detected {len(segments)} segments in reference take.")
+
+    if debug_emotion:
+        print(f"[PASS 2] Detected {len(segments)} segments in reference take.")
 
     # Segment-level rows
     seg_rows = []
@@ -431,15 +495,15 @@ def run_feature_extraction(
 
     out_csv_segments = scoring_dir / f"segments-{singer_id}-{phrase_num}-{alpha_int}.csv"
     df_seg.to_csv(out_csv_segments, index=False)
-
-    print(f"\n[PASS 2] Segment-level scores written to {out_csv_segments}")
-    print(
-        df_seg[
-            ["segment_idx", "phrase", "take", "seg_start_s", "seg_end_s", "final_score"]
-        ]
-        .head(15)
-        .to_string(index=False)
-    )
+    if debug_emotion:
+        print(f"\n[PASS 2] Segment-level scores written to {out_csv_segments}")
+        print(
+            df_seg[
+                ["segment_idx", "phrase", "take", "seg_start_s", "seg_end_s", "final_score"]
+            ]
+            .head(15)
+            .to_string(index=False)
+        )
 
     # ------------------------------------------------------------------
     # Build comp map JSON: winner + near-equal candidates per segment.
@@ -493,6 +557,9 @@ def run_feature_extraction(
             }
         )
 
+    # Compute default boundary crossfade windows
+    boundaries = compute_default_boundaries(segments_summary, fade_fraction)
+
     compmap = {
         "phrase": phrase_name,
         "alpha": alpha,
@@ -502,6 +569,12 @@ def run_feature_extraction(
         "relative_path": rel,
         "reference_take": ref_id,
         "segments": segments_summary,
+        "boundaries": boundaries,
+        "xfade_defaults": {
+            "fade_fraction": float(fade_fraction),
+            "min_sec": 0.030,
+            "max_sec": 0.500,
+        },
     }
 
     # Decide final compmap path
