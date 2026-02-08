@@ -11,6 +11,8 @@
 // - Draw waveform with playhead and loop region
 // - BPM display + metronome toggle + vertical-drag BPM control
 
+class CompedAuditionSource;
+
 class CompingProgressComponent : public juce::Component
 {
 public:
@@ -18,6 +20,11 @@ public:
     ~CompingProgressComponent() override;
 
     NeonProgressBar& getProgressBar() noexcept;
+    
+    void startCompingProgress(const juce::File& features,
+                              const juce::File& segments,
+                              const juce::File& compmap,
+                              const juce::File& comped);
 
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -60,6 +67,21 @@ public:
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;
     void mouseMove(const juce::MouseEvent& event) override;
+    
+    void promptSaveOnExit();
+    
+    void restartPlaybackForCompEdit();
+    
+    void restartCompPlaybackIfPlaying();
+    
+    void showWelcomePopup();
+    void loadExampleProject();
+    
+    void launchMLServer();
+    
+    bool quitAfterSave = false;
+    
+    
 
 private:
     // === UI ===
@@ -98,10 +120,15 @@ private:
 
     juce::TextButton compingButton{ "COMPING" };
     juce::TextButton   exportCompedButton{ "EXPORT SELECTED" };
+    juce::ToggleButton mlModeToggle; // ml support
 
     // Comping progress pop-up
     CompingProgressComponent* compingProgressComponent = nullptr;
     juce::DialogWindow* compingDialogWindow = nullptr;
+
+    bool getCompWaveAreaForInteraction(juce::Rectangle<int>& outCompWaveArea) const;
+    double compedXToTime(int x, const juce::Rectangle<int>& compWaveArea) const;
+
 
     void onCompingFinished(bool success);
 
@@ -119,7 +146,9 @@ private:
 
     // Comped review state  // NEW
     juce::AudioThumbnail compedThumbnail{ 512, formatManager, thumbnailCache }; // NEW
-    bool hasCompedThumbnail = false;                                             // NEW
+    bool hasCompedThumbnail = false;
+    
+    friend class CompedAuditionSource;
 
     struct CompSegment       // NEW
     {                        // NEW
@@ -130,8 +159,32 @@ private:
     juce::Array<CompSegment> compSegments;   // NEW
 
     std::unique_ptr<juce::AudioFormatReaderSource> readerSource;
+    std::unique_ptr<CompedAuditionSource> compedAuditionSource;
+
     juce::AudioTransportSource transportSource;
     juce::File currentInstrumentalFile;
+
+    // Manual crossfade editing (Comped tab)
+// boundary b corresponds to between compSegments[b] and compSegments[b+1]
+    struct CompBoundary
+    {
+        double xfadeStartSec = 0.0;
+        double xfadeEndSec = 0.0;
+        int    leftSegIndex = -1;
+    };
+
+    juce::Array<CompBoundary> compBoundaries;
+    
+    juce::ChildProcess mlServerProcess;
+
+    // Cache full compmap JSON so we can edit without losing fields
+    juce::var compmapJsonCache;
+
+    // Drag state for Comped-tab crossfade handles (separate from loop handles)
+    enum class CompDragMode { None, XFadeStart, XFadeEnd, SegmentBoundary };
+    int activeBoundaryIndex = -1;
+    CompDragMode compDragMode = CompDragMode::None;
+
 
     // Recording writer for full_N.wav
     juce::WavAudioFormat wavFormat;
@@ -139,6 +192,11 @@ private:
     juce::CriticalSection writerLock;
     double currentSampleRate = 44100.0;
     juce::AudioSampleBuffer recordingInputBuffer;
+
+    // === Grid Tooltip State ===
+    bool gridTooltipDismissed = false; // Has user performed the action yet?
+    bool isHoveringInstrumental = false;
+    juce::Point<int> lastMousePosition;
 
     // Last comping result (for the Comped tab later)
         // Last comping result (for the Comped tab later)
@@ -148,20 +206,57 @@ private:
     int        lastCompCrossfadePct = 0;   // 0..100 (Crossfade slider value)
     double     lastCompFadeFraction = 0.0;
     bool       hasLastCompResult = false;
+    bool hasCompedAuditionSource = false;
 
     // State for the single comped row in the CompReview view
     bool       compedSelected = true;      // play with instrumental
     bool       compedSolo = false;     // play comped only
 
+    // Comped view helpers
+    juce::Colour getColourForTake(int takeIndex) const;
+    void drawCompedTopBar(juce::Graphics& g,
+                          const juce::Rectangle<int>& topBar,
+                          const juce::Rectangle<int>& compWaveArea);
 
+    void drawZebraStripes(juce::Graphics& g,
+                          const juce::Rectangle<int>& r,
+                          juce::Colour c1,
+                          juce::Colour c2) const;
+
+    void drawCompedWaveformRealtime(juce::Graphics& g,
+                                    const juce::Rectangle<int>& area);
+
+    float renderCompSampleAtTime(double tSec, int& cachedSeg) const;
+    
+    // MainComponent.h  (add to private section)
+    bool buildCompedAuditionSourceForExport(std::unique_ptr<CompedAuditionSource>& outSource,
+                                            double& outLengthSec,
+                                            juce::String& outError);
+
+    void exportCompedAuditionToFileAsync(const juce::File& targetFile);
+    
+    // --- Segmentation point manipulation ---
+    bool getCompWaveAndTopBarForInteraction(juce::Rectangle<int>& compWaveArea,
+                                            juce::Rectangle<int>& topBarRect) const;
+
+    void clampBoundaryWindowToSegments(int boundaryIndex);
+    void updateCompedAuditionSourceFromEdits();
+
+    // For correct clamping
+    void sanitizeCompSegments();
 
     // Loop selection in seconds (Ableton-style arrangement loop)
     double loopStartSec = 0.0;
     double loopEndSec = 0.0;
     double minLoopLengthSec = 5.0;  // minimum loop length
 
-    enum class DragMode { none, leftHandle, rightHandle, bpmAdjust };
+    enum class DragMode { none, leftHandle, rightHandle, bpmAdjust, gridAdjust };
     DragMode dragMode = DragMode::none;
+
+    double gridOffsetSec = 0.0;     // The time shift for the grid
+    double snapToGrid(double time); // Helper function
+    double gridDragLastMouseTime = 0.0;
+    bool   gridDragHasLast = false;
 
     // === Vocal recording visual state ===
     struct TakeTrack
@@ -185,6 +280,22 @@ private:
     juce::AudioSampleBuffer takeMixBuffer;
     int selectedTakeIndex = -1; // for take sleecion
     int soloTakeIndex = -1; // for oslo
+    
+    void startPlaybackForSelection(bool playInstrumental, bool playTake);
+    void stopAllPlayback();
+    bool isSoloPlayback() const;
+    double getPlayheadPositionSec() const;
+    void enforceLoopWrap();
+    
+    
+
+    bool compedAuditionReady = false;
+
+    bool ensureCompedAuditionSourceReady(); // loads take_*.wav and attaches takeTransport to audition source
+    bool isCompedAuditionReady() const noexcept { return compedAuditionReady && compedAuditionSource != nullptr; }
+
+
+
 
     // --- Scrollable takes view (Recording tab) ---
     juce::Viewport takesViewport;
@@ -201,6 +312,13 @@ private:
         juce::Rectangle<int>& labelRect,
         juce::Rectangle<int>& waveRect,
         juce::Rectangle<int>& controlsRect) const;
+
+    void drawBeatGrid(juce::Graphics& g,
+        const juce::Rectangle<int>& innerBounds,
+        double totalLengthSec) const;
+
+    void rebuildCompedFromEditedCompmapAsync();
+
 
 
 
@@ -248,6 +366,7 @@ private:
     void launchProjectLoadChooser();
     bool loadCompedFile(const juce::File& compedFile);
     bool loadLastCompForReview();
+    bool prepareCompedAuditionSource();
 
 
 

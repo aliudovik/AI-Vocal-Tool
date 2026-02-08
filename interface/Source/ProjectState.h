@@ -13,6 +13,16 @@ struct CompSegmentState
     static CompSegmentState fromVar(const juce::var& v);
 };
 
+struct CompBoundaryState
+{
+    int leftSegIndex = 0;
+    double xfadeStartSec = 0.0;
+    double xfadeEndSec = 0.0;
+
+    juce::var toVar() const;
+    static CompBoundaryState fromVar(const juce::var& v);
+};
+
 // Full project state that can be saved/loaded as JSON
 struct ProjectState
 {
@@ -53,6 +63,9 @@ struct ProjectState
 
     bool compedSelected = true;
     bool compedSolo = false;
+    
+    double gridOffsetSec = 0.0;
+        juce::Array<CompBoundaryState> compBoundaries;
 
     // Which tab was active
     bool viewIsCompReview = false;
@@ -63,6 +76,8 @@ struct ProjectState
     // Serialisation helpers
     juce::var      toVar() const;
     static ProjectState fromVar(const juce::var& v);
+    
+    static ProjectState fromVar(const juce::var& v, const juce::File& projectRoot);
 
     static bool saveToFile(const ProjectState& state,
         const juce::File& file,

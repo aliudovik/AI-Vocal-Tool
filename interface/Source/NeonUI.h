@@ -158,6 +158,9 @@ public:
         int numSamples);
 
     int  getTakeIndex() const noexcept { return index; }
+    
+    juce::Button& getSelectButton() { return selectButton; }
+    juce::Button& getSoloButton()   { return soloButton; }
 
     void paint(juce::Graphics& g) override;
     void resized() override;
@@ -190,17 +193,29 @@ private:
 //==============================================================================
 
 class NeonProgressBar : public juce::Component,
-    private juce::Timer
+                        private juce::Timer
 {
 public:
     NeonProgressBar() = default;
 
-    void startComping()
+    // NEW: start with real file paths
+    void startCompingWithFiles(const juce::File& features,
+                               const juce::File& segments,
+                               const juce::File& compmap,
+                               const juce::File& comped)
     {
+        featuresFile = features;
+        segmentsFile = segments;
+        compmapFile  = compmap;
+        compedFile   = comped;
+
         backendFinished = false;
         progress01 = 0.0;
         elapsedSeconds = 0.0;
-        startTimer(40); // ~25fps
+        stageElapsed = 0.0;
+        stage = Stage::Feature;
+
+        startTimer(40);
         repaint();
     }
 
@@ -219,11 +234,31 @@ public:
 private:
     void timerCallback() override;
 
-    double progress01 = 0.0;      // 0.0–1.0
+    enum class Stage { Feature, Segment, Compmap, Stitch, Done };
+    Stage stage = Stage::Feature;
+
+    juce::File featuresFile, segmentsFile, compmapFile, compedFile;
+
+    double progress01 = 0.0;
     bool   backendFinished = false;
     double elapsedSeconds = 0.0;
+    double stageElapsed = 0.0;
 
-    static constexpr double maxDurationSeconds = 90.0;
+    juce::String stageLabel;
+
+    void advanceStage(Stage nextStage)
+    {
+        stage = nextStage;
+        stageElapsed = 0.0;
+    }
+
+    void updateProgress(double startPct, double endPct, const juce::String& label)
+    {
+        stageLabel = label;
+        const double span = endPct - startPct;
+        const double pct = startPct + juce::jmin(stageElapsed, span); // 1% per sec
+        progress01 = juce::jlimit(0.0, 1.0, pct / 100.0);
+    }
 };
 
 

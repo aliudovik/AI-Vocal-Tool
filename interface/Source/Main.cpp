@@ -75,14 +75,19 @@ public:
            #endif
 
             setVisible (true);
+            
+            juce::MessageManager::callAsync([this]()
+            {
+                setFullScreen(true);   // this is exactly the macOS fullscreen mode
+            });
         }
 
         void closeButtonPressed() override
         {
-            // This is called when the user tries to close this window. Here, we'll just
-            // ask the app to quit when this happens, but you can change this to do
-            // whatever you need.
-            JUCEApplication::getInstance()->systemRequestedQuit();
+            if (auto* mc = dynamic_cast<MainComponent*>(getContentComponent()))
+                mc->promptSaveOnExit();
+            else
+                juce::JUCEApplication::getInstance()->systemRequestedQuit();
         }
 
         /* Note: Be careful if you override any DocumentWindow methods - the base

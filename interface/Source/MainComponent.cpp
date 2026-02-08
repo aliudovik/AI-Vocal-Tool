@@ -1,5 +1,11 @@
 // MainComponent.cpp
 #include "MainComponent.h"
+#include "CompedAuditionSource.h"
+#include "AppPaths.h"
+#if JUCE_WINDOWS
+#include <Windows.h>
+#endif
+
 
 
 
@@ -74,8 +80,9 @@ CompingProgressComponent::CompingProgressComponent(NeonLookAndFeel& lf)
     titleLabel.setText("AI Comping in progress", juce::dontSendNotification);
     titleLabel.setJustificationType(juce::Justification::centred);
     titleLabel.setInterceptsMouseClicks(false, false);
+    
+    
 
-    progressBar.startComping();  // start animation immediately
 
     setSize(380, 140);
 }
@@ -109,20 +116,65 @@ void CompingProgressComponent::resized()
     progressBar.setBounds(area);
 }
 
+void setupPythonEnv()
+{
+    auto pyDir = AppPaths::pythonDir().getFullPathName();
+    auto rootDir = AppPaths::root().getFullPathName();   // <-- the parent of src/
+    auto srcDir = AppPaths::srcDir().getFullPathName();
+    auto mlDir = AppPaths::mlDir().getFullPathName();
 
+#if JUCE_WINDOWS
+    ::SetEnvironmentVariableW(L"PYTHONPATH",
+        (rootDir + ";" + srcDir + ";" + mlDir).toWideCharPointer());
+
+    juce::String oldPath = juce::SystemStats::getEnvironmentVariable("PATH", "");
+    juce::String newPath = pyDir + ";" + oldPath;
+    ::SetEnvironmentVariableW(L"PATH", newPath.toWideCharPointer());
+#else
+    setenv("PYTHONPATH", (rootDir + ":" + srcDir + ":" + mlDir).toRawUTF8(), 1);
+    #endif
+}
 
 MainComponent::MainComponent()
 {
     setLookAndFeel(&neonLookAndFeel);
 
+
+
+    setupPythonEnv();
+
+    // Debug: log what PYTHONPATH is set to
+    juce::String pypath = juce::SystemStats::getEnvironmentVariable("PYTHONPATH", "(not set)");
+    juce::Logger::writeToLog("PYTHONPATH = " + pypath);
+
+    neonLookAndFeel.setUsingNativeAlertWindows(true);
+
+    static bool loggerSet = false;
+    if (!loggerSet)
+    {
+        loggerSet = true;
+        juce::Logger::setCurrentLogger(new juce::FileLogger(
+            AppPaths::root().getChildFile("debug_log.txt"),
+            "Log", 1024 * 1024));
+    }
+    ;
+
     // Set window size
-    setSize(800, 400);
+    auto area = juce::Desktop::getInstance().getDisplays()
+        .getMainDisplay().userArea;
+
+    int w = juce::jmin(1600, area.getWidth());
+    int h = juce::jmin(900, area.getHeight());
+    setSize(w, h);
 
     // --- Audio setup ---
     formatManager.registerBasicFormats(); // WAV, AIFF, etc.
 
     // 1 input (for mic), 2 outputs
     setAudioChannels(1, 2);
+
+    AppPaths::ensureFoldersExist();
+    AppPaths::root().setAsCurrentWorkingDirectory();
 
     // Initialise data_pilot/singer_user/phraseXX for this session
     initialiseUserPhraseDirectory();
@@ -156,6 +208,10 @@ MainComponent::MainComponent()
     addAndMakeVisible(takesViewport);
     addAndMakeVisible(compedSelectButton);
     addAndMakeVisible(compedSoloButton);
+    // MainComponent_Views.cpp  (inside MainComponent constructor)
+    addAndMakeVisible(mlModeToggle);
+    mlModeToggle.setButtonText("Use ML Scoring (experimental)");
+    mlModeToggle.setToggleState(false, juce::dontSendNotification);
 
     compedSelectButton.setClickingTogglesState(true);
     compedSoloButton.setClickingTogglesState(true);
@@ -292,6 +348,176 @@ MainComponent::MainComponent()
     updateTabButtonStyles();
     refreshCompedButtons();
 
+    juce::Timer::callAfterDelay(337, [this]
+        {
+            showWelcomePopup();
+        });
+
+    juce::MessageManager::callAsync([this]()
+        {
+            launchMLServer();
+        });
+
+}
+
+void MainComponent::launchMLServer()
+{
+    // Don't start twice
+    if (mlServerProcess.isRunning())
+        return;
+
+    juce::File projectRoot = AppPaths::root();
+
+    if (!projectRoot.isDirectory())
+        projectRoot = juce::File::getCurrentWorkingDirectory();
+
+    const bool isWindows = juce::SystemStats::getOperatingSystemType() & juce::SystemStats::Windows;
+
+    juce::File pythonExe = AppPaths::pythonExe();
+
+    if (!pythonExe.existsAsFile())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "ML server error",
+            "Bundled Python not found:\n" + pythonExe.getFullPathName());
+        return;
+    }
+
+    juce::File serverPy = AppPaths::mlDir().getChildFile("server.py");
+
+    if (!serverPy.existsAsFile())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "ML server error",
+            "server.py not found:\n" + serverPy.getFullPathName());
+        return;
+    }
+
+    juce::StringArray args;
+    args.add(pythonExe.getFullPathName());
+    args.add(serverPy.getFullPathName());
+
+    // JUCE has no cwd argument, so temporarily set it and restore
+    struct CwdRestorer
+    {
+        juce::File old;
+        CwdRestorer() : old(juce::File::getCurrentWorkingDirectory()) {}
+        ~CwdRestorer() { old.setAsCurrentWorkingDirectory(); }
+    } restore;
+
+    projectRoot.setAsCurrentWorkingDirectory();
+
+    if (!mlServerProcess.start(args))
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "ML server error",
+            "Could not launch ML server.\nCommand:\n" + args.joinIntoString(" "));
+        return;
+    }
+
+    // Success: server is running in background
+}
+
+void MainComponent::showWelcomePopup()
+{
+    auto options = juce::MessageBoxOptions()
+        .withIconType(juce::MessageBoxIconType::InfoIcon)
+        .withTitle("Welcome")
+        .withMessage(
+            "Welcome to your Vocal Comping Assistant Alpha! "
+            "If you find any bugs, drop a message to pr.ae@outlook.com. "
+            "Note that there is a slight delay with recorded takes playback - "
+            "will be fixed in the very next version.")
+        .withButton("Load Example")
+        .withButton("OK")
+        .withAssociatedComponent(getTopLevelComponent());
+
+    juce::NativeMessageBox::showAsync(options,
+        [this](int result)
+        {
+            // NativeMessageBox returns 0 for the first button
+            if (result == 0)
+                loadExampleProject();
+        });
+}
+
+void MainComponent::loadExampleProject()
+{
+    // find project root by walking up until we see "data_pilot"
+    juce::File root = AppPaths::root();
+
+    while (!root.isRoot() && !root.getChildFile("data_pilot").isDirectory())
+        root = root.getParentDirectory();
+
+    juce::File exampleFile = root.getChildFile(
+        "data_pilot/singer_user/phrase78/project_example.json");
+
+    if (!exampleFile.existsAsFile())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "Example not found",
+            "Could not find:\n" + exampleFile.getFullPathName());
+        return;
+    }
+
+    ProjectState state;
+    juce::String error;
+
+    if (!ProjectState::loadFromFile(state, exampleFile, error))
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "Load failed",
+            "Could not load example:\n" + error);
+        return;
+    }
+
+    resetProjectState();
+    applyProjectState(state);
+
+    juce::AlertWindow::showMessageBoxAsync(
+        juce::AlertWindow::InfoIcon,
+        "Example loaded",
+        "Loaded example project:\n" + exampleFile.getFullPathName());
+}
+
+void MainComponent::restartPlaybackForCompEdit()
+{
+    const bool wasPlaying = transportSource.isPlaying() || takeTransport.isPlaying();
+
+    transportSource.stop();
+    takeTransport.stop();
+
+    // reset positions
+    transportSource.setPosition(loopStartSec); // or 0.0 if you want absolute start
+    takeTransport.setPosition(0.0);
+
+    if (wasPlaying)
+    {
+        transportSource.start();
+        takeTransport.start();
+    }
+}
+
+void MainComponent::restartCompPlaybackIfPlaying()
+{
+    const bool wasPlaying = transportSource.isPlaying() || takeTransport.isPlaying();
+
+    transportSource.stop();
+    takeTransport.stop();
+
+    transportSource.setPosition(loopStartSec); // or 0.0 if you want absolute start
+    takeTransport.setPosition(0.0);
+
+    if (wasPlaying)
+    {
+        transportSource.start();
+        takeTransport.start();
+    }
 }
 
 MainComponent::~MainComponent()
@@ -305,6 +531,9 @@ MainComponent::~MainComponent()
         compingDialogWindow = nullptr;
         compingProgressComponent = nullptr;
     }
+
+    if (mlServerProcess.isRunning())
+        mlServerProcess.kill();
 
     setLookAndFeel(nullptr);
     shutdownAudio();
@@ -326,6 +555,16 @@ void MainComponent::onCompingFinished(bool /*success*/)
         compingDialogWindow = nullptr;
         compingProgressComponent = nullptr;
     }
+
+
+}
+
+void CompingProgressComponent::startCompingProgress(const juce::File& features,
+    const juce::File& segments,
+    const juce::File& compmap,
+    const juce::File& comped)
+{
+    progressBar.startCompingWithFiles(features, segments, compmap, comped);
 }
 
 

@@ -793,23 +793,52 @@ void NeonLookAndFeel::drawScrollbar(juce::Graphics& g,
 
 void NeonProgressBar::timerCallback()
 {
-    const double dt = getTimerInterval() * 0.001; // ms -> seconds
+    const double dt = getTimerInterval() * 0.003;
     elapsedSeconds += dt;
+    stageElapsed   += dt;
 
-    if (!backendFinished)
-    {
-        const double clampedElapsed = juce::jlimit(0.0, maxDurationSeconds, elapsedSeconds);
-        const double windowFraction = (maxDurationSeconds > 0.0)
-            ? (clampedElapsed / maxDurationSeconds)
-            : 1.0;
-        const double targetProgress01 = 0.95 * windowFraction;
-
-        progress01 = juce::jlimit(0.0, 0.95, targetProgress01);
-    }
-    else
+    if (backendFinished)
     {
         progress01 = 1.0;
         stopTimer();
+        repaint();
+        return;
+    }
+
+    switch (stage)
+    {
+        case Stage::Feature:
+            updateProgress(0.0, 67.0, "Scoring...");
+            if (featuresFile.existsAsFile())
+                advanceStage(Stage::Segment);
+            break;
+
+        case Stage::Segment:
+            updateProgress(67.0, 85.0, "Segmenting...");
+            if (segmentsFile.existsAsFile())
+                advanceStage(Stage::Compmap);
+            break;
+
+        case Stage::Compmap:
+            updateProgress(85.0, 93.0, "Writing compmap...");
+            if (compmapFile.existsAsFile())
+                advanceStage(Stage::Stitch);
+            break;
+
+        case Stage::Stitch:
+            updateProgress(93.0, 97.0, "Stitching...");
+            if (compedFile.existsAsFile())
+            {
+                backendFinished = true;
+                progress01 = 1.0;
+                stopTimer();
+            }
+            break;
+
+        case Stage::Done:
+            progress01 = 1.0;
+            stopTimer();
+            break;
     }
 
     repaint();
@@ -888,11 +917,11 @@ void NeonProgressBar::paint(juce::Graphics& g)
     juce::String label;
 
     if (backendFinished && progress01 >= 0.999)
-        label = "Done – 100%";
+        label = "Done - 100%";
     else if (pct <= 0)
         label = "Comping ready";
     else
-        label = "Comping " + juce::String(pct) + "%";
+        label = stageLabel + " " + juce::String(pct) + "%";
 
     juce::Font font = neonLF
         ? neonLF->getUiFont(14.0f, true)

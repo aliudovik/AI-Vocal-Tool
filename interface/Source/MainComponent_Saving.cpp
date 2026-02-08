@@ -50,6 +50,20 @@ ProjectState MainComponent::createProjectState() const
         cs.takeIndex = seg.takeIndex;
         s.compSegments.add(cs);
     }
+    
+    // SAVE grid offset
+    s.gridOffsetSec = gridOffsetSec;
+
+    // SAVE manual crossfade boundaries
+    s.compBoundaries.clear();
+    for (const auto& b : compBoundaries)
+    {
+        CompBoundaryState bs;
+        bs.leftSegIndex = b.leftSegIndex;
+        bs.xfadeStartSec = b.xfadeStartSec;
+        bs.xfadeEndSec = b.xfadeEndSec;
+        s.compBoundaries.add(bs);
+    }
 
     return s;
 }
@@ -94,6 +108,9 @@ void MainComponent::resetProjectState()
     takeTransport.stop();
     takeTransport.setSource(nullptr);
     takeReaderSource.reset();
+    
+    gridOffsetSec = 0.0;
+    compBoundaries.clear();
 
     {
         const juce::ScopedLock sl(vocalLock);
@@ -169,6 +186,8 @@ void MainComponent::applyProjectState(const ProjectState& s)
     lastCompFadeFraction = 0.0;
     compedSelected = true;
     compedSolo = false;
+    
+    gridOffsetSec = s.gridOffsetSec;
 
     currentPhraseDirectory = juce::File(s.currentPhraseDirectory);
     currentPhraseIndex = s.currentPhraseIndex;
@@ -272,6 +291,23 @@ void MainComponent::applyProjectState(const ProjectState& s)
                 seg.takeIndex = cs.takeIndex;
                 compSegments.add(seg);
             }
+            
+        
+        }
+        
+        // RESTORE manual crossfade boundaries from saved project
+        if (s.compBoundaries.size() == compSegments.size() - 1)
+        {
+            compBoundaries.clear();
+            for (const auto& bs : s.compBoundaries)
+            {
+                CompBoundary cb;
+                cb.leftSegIndex = bs.leftSegIndex;
+                cb.xfadeStartSec = bs.xfadeStartSec;
+                cb.xfadeEndSec = bs.xfadeEndSec;
+                compBoundaries.add(cb);
+            }
+            updateCompedAuditionSourceFromEdits();
         }
 
         hasLastCompResult = true;
@@ -327,8 +363,12 @@ void MainComponent::saveProjectToFile()
             juce::File target = fc.getResult();
             fileChooser.reset();
 
+            // --- user cancelled ---
             if (!target.getFullPathName().isNotEmpty())
+            {
+                quitAfterSave = false;
                 return;
+            }
 
             if (target.getFileExtension().isEmpty())
                 target = target.withFileExtension(".json");
@@ -336,6 +376,7 @@ void MainComponent::saveProjectToFile()
             juce::String error;
             if (!ProjectState::saveToFile(state, target, error))
             {
+                quitAfterSave = false;
                 juce::AlertWindow::showMessageBoxAsync(
                     juce::AlertWindow::WarningIcon,
                     "Save project failed",
@@ -347,6 +388,13 @@ void MainComponent::saveProjectToFile()
                 juce::AlertWindow::InfoIcon,
                 "Project saved",
                 "Project saved to:\n" + target.getFullPathName());
+
+            // --- quit if this save was triggered by "Save and Close"
+            if (quitAfterSave)
+            {
+                quitAfterSave = false;
+                juce::JUCEApplication::getInstance()->systemRequestedQuit();
+            }
         });
 }
 
@@ -439,6 +487,35 @@ void MainComponent::loadProjectFromFile()
 }
 
 
+// Suggest saving upon the program closing
+
+void MainComponent::promptSaveOnExit()
+{
+    auto* w = new juce::AlertWindow(
+        "Quit",
+        "Any unsaved changes will be lost! This alpha doesn't have an automatic backup feature.",
+        juce::AlertWindow::WarningIcon);
+
+    w->addButton("Save and Close", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Close - no saving", 0);
+
+    w->enterModalState(true,
+        juce::ModalCallbackFunction::create([this, w](int result)
+        {
+            if (result == 1)  // Save and Close
+            {
+                quitAfterSave = true;
+                saveProjectToFile();   // your existing function
+            }
+            else              // Close - no saving
+            {
+                juce::JUCEApplication::getInstance()->systemRequestedQuit();
+            }
+        }),
+        true);
+}
+
+
 
 //==============================================================================
 // BPM helpers
@@ -446,42 +523,50 @@ void MainComponent::loadProjectFromFile()
 
 void MainComponent::promptForBpm()
 {
-    auto* w = new juce::AlertWindow("Set BPM",
-        {},
-        juce::AlertWindow::NoIcon);
+    auto* w = new juce::AlertWindow("Set BPM", {}, juce::AlertWindow::NoIcon);
 
-    w->addTextBlock("BPM is essential for successful Vocal Comping.");
+    w->setSize(420, 220);
+
+    // ---- full‑width centred message ----
+    auto* msg = new juce::Label();
+    msg->setText("BPM is essential for successful Vocal Comping.\n\n"
+                 "To align, click shift and drag your mouse on the beat grid.",
+                 juce::dontSendNotification);
+    msg->setJustificationType(juce::Justification::centred);
+    msg->setMinimumHorizontalScale(1.0f);
+
+    const int margin = 24;
+    msg->setSize(w->getWidth() - margin * 2, 80);   // full width minus equal margins
+    w->addCustomComponent(msg);
+    // -----------------------------------
+
     w->addTextEditor("bpm", juce::String(bpm), "BPM:");
-
     if (auto* editor = w->getTextEditor("bpm"))
         editor->setJustification(juce::Justification::centred);
 
     w->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
 
-    w->setSize(420, 220);
     w->centreAroundComponent(this, w->getWidth(), w->getHeight());
 
     w->enterModalState(true,
         juce::ModalCallbackFunction::create([this, w](int result)
+        {
+            if (result != 0)
             {
-                if (result != 0)
-                {
-                    auto text = w->getTextEditorContents("bpm");
-                    int  value = text.getIntValue();
+                auto text = w->getTextEditorContents("bpm");
+                int value = text.getIntValue();
+                if (value <= 0) value = bpm;
 
-                    if (value <= 0)
-                        value = bpm;
-
-                    bpm = juce::jlimit(40, 240, value);
-                    bpmSet = true;
-                    refreshBpmLabel();
-                }
-                else
-                {
-                    bpmSet = true;
-                    refreshBpmLabel();
-                }
-            }),
+                bpm = juce::jlimit(40, 240, value);
+                bpmSet = true;
+                refreshBpmLabel();
+            }
+            else
+            {
+                bpmSet = true;
+                refreshBpmLabel();
+            }
+        }),
         true);
 }
 

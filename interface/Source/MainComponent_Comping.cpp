@@ -1,14 +1,34 @@
 // MainComponent_Comping.cpp
 #include "MainComponent.h"
 #include <thread>
+#include "CompedAuditionSource.h"
+#include "AppPaths.h"
+
 
 //==============================================================================
 
+void MainComponent::sanitizeCompSegments()
+{
+    // Fix start/end order
+    for (auto& s : compSegments)
+    {
+        if (s.endSec < s.startSec)
+            std::swap(s.startSec, s.endSec);
+    }
 
+    // Sort segments by start
+    std::sort(compSegments.begin(), compSegments.end(),
+              [](const CompSegment& a, const CompSegment& b)
+              {
+                  return a.startSec < b.startSec;
+              });
+}
 
 void MainComponent::runCompingFromGui()
 {
     // ---- QUICK VALIDATION ON UI THREAD ----
+    
+    juce::Component::SafePointer<MainComponent> safeThis(this);
 
     if (isRecording)
     {
@@ -52,6 +72,7 @@ void MainComponent::runCompingFromGui()
     const int    crossfadePct = juce::jlimit(0, 100, juce::roundToInt(cfSliderVal));
     const double fadeFraction = juce::jmap(cfSliderVal, 0.0, 100.0, 0.05, 0.30);
     const int    bpmValue = bpm;
+    const bool debugML = false; // ML DEBUG
 
     const juce::String phraseNum = juce::String(currentPhraseIndex).paddedLeft('0', 2);
     const juce::String select = "singer_user/phrase" + phraseNum;
@@ -68,6 +89,10 @@ void MainComponent::runCompingFromGui()
 
     const juce::String compmapName = "compmap-" + juce::String(alphaPct) + ".json";
     juce::File compmapTargetFile = currentPhraseDirectory.getChildFile(compmapName);
+    
+
+    
+    
 
     // Remember last result metadata (file paths & settings)
     lastCompedFile = compedTargetFile;
@@ -78,39 +103,52 @@ void MainComponent::runCompingFromGui()
     compedSelected = true;
     compedSolo = false;
     refreshCompedButtons();
+    
+    const bool mlUsed = mlModeToggle.getToggleState();
 
     // Figure out project root and python path
-    juce::File projectRoot =
-        currentPhraseDirectory.getParentDirectory()
-        .getParentDirectory()
-        .getParentDirectory();
+    juce::File projectRoot = AppPaths::root();
 
     if (!projectRoot.isDirectory())
         projectRoot = juce::File::getCurrentWorkingDirectory();
 
     DBG("runCompingFromGui(): projectRoot=" << projectRoot.getFullPathName());
+    juce::Logger::writeToLog("runCompingFromGui(): projectRoot=" + projectRoot.getFullPathName());
 
-    juce::File pythonExe = projectRoot
-        .getChildFile(".venv")
-        .getChildFile("Scripts")
-        .getChildFile("python.exe");
+    
 
+    // --- Cross-Platform Python Path ---
+    juce::File pythonExe   = AppPaths::pythonExe();
+
+
+    
     if (!pythonExe.existsAsFile())
     {
         juce::AlertWindow::showMessageBoxAsync(
             juce::AlertWindow::WarningIcon,
             "Comping error",
-            "Python virtual environment not found at:\n"
-            + pythonExe.getFullPathName()
-            + "\n\nCheck your venv location and update runCompingFromGui().");
+            "Bundled Python not found:\n" + pythonExe.getFullPathName());
+        return;
+    }
+    
+    DBG("Python exe: " + pythonExe.getFullPathName());
+    juce::Logger::writeToLog("runCompingFromGui(): python exe=" + pythonExe.getFullPathName());
+    // Build arguments for the Python call
+    juce::File runCompingPy = AppPaths::srcDir().getChildFile("run_comping.py");
+
+    if (!runCompingPy.existsAsFile())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "Comping error",
+            "run_comping.py not found:\n" + runCompingPy.getFullPathName());
         return;
     }
 
-    // Build arguments for the Python call
     juce::StringArray args;
     args.add(pythonExe.getFullPathName());
-    args.add("-m");
-    args.add("src.run_comping");
+    args.add("-u");  // unbuffered output ? critical for reliable capture
+    args.add(runCompingPy.getFullPathName());
     args.add("--base");
     args.add("data_pilot");
     args.add("--select");
@@ -121,6 +159,10 @@ void MainComponent::runCompingFromGui()
     args.add(juce::String(bpmValue));
     args.add("--fade_fraction");
     args.add(juce::String(fadeFraction));
+    if (mlUsed)
+    {
+        args.add("--use_ml");
+    }
 
     args.add("--out_dir");
     args.add(currentPhraseDirectory.getFullPathName());
@@ -130,131 +172,228 @@ void MainComponent::runCompingFromGui()
     args.add("--out_compmap_path");
     args.add(compmapTargetFile.getFullPathName());
 
+    juce::Logger::writeToLog("runCompingFromGui(): python args " + args.joinIntoString(" "));
+
     // Make copies for the background thread (no references!)
     auto projectRootCopy = projectRoot;
     auto argsCopy = args;
     auto compedFileCopy = compedTargetFile;
     auto compmapFileCopy = compmapTargetFile;
+    auto ppath = pythonExe.getFullPathName();
+    
+    // Build expected progress files
+    juce::File scoringDir = currentPhraseDirectory.getChildFile(
+        "scoring-user-" + phraseNum + "-" + juce::String(alphaPct));
+
+    juce::File featuresFile = scoringDir.getChildFile(
+        "features-user-" + phraseNum + "-" + juce::String(alphaPct) + ".csv");
+
+    juce::File segmentsFile = scoringDir.getChildFile(
+        "segments-user-" + phraseNum + "-" + juce::String(alphaPct) + ".csv");
+
+    // Start progress bar with real files
+    if (compingProgressComponent != nullptr)
+    {
+        compingProgressComponent->startCompingProgress(
+            featuresFile, segmentsFile, compmapTargetFile, compedTargetFile);
+    }
+    
 
     // ---- DO THE HEAVY WORK ON A BACKGROUND THREAD ----
-    std::thread([this,
+    std::thread([safeThis,
         projectRootCopy,
         argsCopy,
         compedFileCopy,
-        compmapFileCopy]() mutable
+        compmapFileCopy,
+        mlUsed, debugML]() mutable
+    {
+        bool success = false;
+        bool compmapMissing = false;
+        juce::String errorMessage;
+        juce::String processOutput;
+        juce::String mlServerMsg;
+
+        juce::File oldCwd = juce::File::getCurrentWorkingDirectory();
+        projectRootCopy.setAsCurrentWorkingDirectory();
+
+        juce::ChildProcess process;
+
+        // ---- Build the command via helper (proper quoting + UTF-8 + stderr) ----
+        juce::String cmd = AppPaths::buildPythonCommand(argsCopy);
+
+        juce::Logger::writeToLog("run_comping CMD: " + cmd);
+        juce::Logger::writeToLog("run_comping CWD: " + projectRootCopy.getFullPathName());
+
+        if (!process.start(cmd))
         {
-            bool success = false;
-            bool compmapMissing = false;
-            juce::String errorMessage;
-            juce::String processOutput;
+            errorMessage = "Could not launch Python process.\nCommand:\n" + cmd;
+            juce::Logger::writeToLog("run_comping: process.start() FAILED");
+        }
+        else
+        {
+            juce::Logger::writeToLog("run_comping: process started OK, waiting...");
 
-            juce::File oldCwd = juce::File::getCurrentWorkingDirectory();
-            projectRootCopy.setAsCurrentWorkingDirectory();
+            const int maxMillis = 180000;
+            const int pollMs = 250;
+            int waited = 0;
 
-            juce::ChildProcess process;
-            if (!process.start(argsCopy))
+            while (process.isRunning() && waited < maxMillis)
             {
-                errorMessage = "Could not launch Python process.\n"
-                    "Command: " + argsCopy.joinIntoString(" ");
+                if (compedFileCopy.existsAsFile())
+                    break;
+
+                process.waitForProcessToFinish(pollMs);
+                waited += pollMs;
             }
-            else
+
+            // Make sure the process has fully exited before reading output
+            if (process.isRunning())
             {
-                // This is the blocking part
-                process.waitForProcessToFinish(-1);
-                processOutput = process.readAllProcessOutput();
+                if (waited >= maxMillis)
+                    process.kill();
+                else
+                    process.waitForProcessToFinish(5000);
+            }
 
-                DBG("run_comping output:\n" + processOutput);
+            processOutput = process.readAllProcessOutput();
+            juce::uint32 exitCode = process.getExitCode();
 
-                // Check that the comped file exists
-                if (!compedFileCopy.existsAsFile())
+            // Log everything to python_debug.log for post-mortem analysis
+            AppPaths::logPythonExecution("run_comping", cmd,
+                projectRootCopy.getFullPathName(), processOutput, exitCode);
+
+            // If ML mode was used, store the server response for UI display
+            if (mlUsed && processOutput.isNotEmpty())
+                mlServerMsg = processOutput;
+
+            if (!compedFileCopy.existsAsFile())
+            {
+                if (waited >= maxMillis)
                 {
-                    errorMessage = "Python finished but the expected comped file "
-                        "was not found:\n"
-                        + compedFileCopy.getFullPathName();
+                    errorMessage = "Comping timed out after " + juce::String(maxMillis / 1000) +
+                        " seconds and no comped file was created.\n\n" +
+                        "Try again or reduce workload (see notes).";
                 }
                 else
                 {
-                    success = true;
-                    compmapMissing = !compmapFileCopy.existsAsFile();
+                    // Include Python output in the error so the user can see what happened
+                    errorMessage = "Python finished (exit code " + juce::String((int)exitCode)
+                        + ") but the expected comped file was not found:\n"
+                        + compedFileCopy.getFullPathName();
+
+                    if (processOutput.isNotEmpty())
+                    {
+                        errorMessage += "\n\n--- Python output ---\n"
+                            + processOutput.substring(0, 1500);
+                    }
+                    else
+                    {
+                        errorMessage += "\n\n(No Python output captured. "
+                            "Check python_debug.log in the app folder for details.)";
+                    }
                 }
             }
+            else
+            {
+                success = true;
+                compmapMissing = !compmapFileCopy.existsAsFile();
+            }
+        }
 
-            // Restore CWD
-            oldCwd.setAsCurrentWorkingDirectory();
+        oldCwd.setAsCurrentWorkingDirectory();
 
-            // Jump back to JUCE message thread for all UI work
-            juce::MessageManager::callAsync([this,
-                success,
-                compmapMissing,
-                errorMessage,
-                compedFileCopy,
-                compmapFileCopy]() mutable
+        juce::MessageManager::callAsync([safeThis,
+            success,
+            compmapMissing,
+            errorMessage,
+            compedFileCopy,
+            compmapFileCopy,
+            mlUsed,
+            mlServerMsg, debugML]() mutable
+        {
+            if (safeThis == nullptr)
+                return;
+
+            if (!success)
+            {
+                safeThis->onCompingFinished(false);
+
+                if (errorMessage.isNotEmpty())
                 {
-                    if (!success)
-                    {
-                        onCompingFinished(false);
-
-                        if (errorMessage.isNotEmpty())
-                        {
-                            juce::AlertWindow::showMessageBoxAsync(
-                                juce::AlertWindow::WarningIcon,
-                                "Comping error",
-                                errorMessage);
-                        }
-
-                        return;
-                    }
-
-                    // Successful comping – load the file into the transport
-                    if (!loadCompedFile(compedFileCopy))
-                    {
-                        onCompingFinished(false);
-                        return;
-                    }
-
-                    hasLastCompResult = true;
-                    lastCompedFile = compedFileCopy;
-                    lastCompmapFile = compmapFileCopy;
-
-                    compedTabButton.setEnabled(true);
-                    updateTabButtonStyles();
-
-                    // Tell the progress component to jump to 100% and close
-                    onCompingFinished(true);
-
-                    // Optional warning if the compmap is missing
-                    if (compmapMissing)
-                    {
-                        juce::AlertWindow::showMessageBoxAsync(
-                            juce::AlertWindow::WarningIcon,
-                            "Comping warning",
-                            "Comped audio was created, but the compmap JSON is missing:\n"
-                            + compmapFileCopy.getFullPathName()
-                            + "\n\nThe Comped tab will not show segment boundaries.");
-                    }
-
-                    // Final "comping complete" dialog that switches to the Comped tab
                     juce::AlertWindow::showMessageBoxAsync(
-                        juce::AlertWindow::InfoIcon,
-                        "Comping complete",
-                        "The comped take has been created and loaded.\n"
-                        "Press PLAY to listen.\n\n"
-                        "You can now review it on the Comped tab.",
-                        "OK",
-                        this,
-                        juce::ModalCallbackFunction::create([this](int)
-                            {
-                                if (!loadLastCompForReview())
-                                    DBG("CompReview: loadLastCompForReview() failed");
+                        juce::AlertWindow::WarningIcon,
+                        "Comping error",
+                        errorMessage);
+                }
+                return;
+            }
 
-                                viewMode = ViewMode::CompReview;
-                                updateTabButtonStyles();
-                                resized();
-                                repaint();
-                            }));
-                });
+            // Show ML server response only in debug mode
+            if (mlUsed && mlServerMsg.isNotEmpty() && debugML)
+            {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::InfoIcon,
+                    "ML Debug Output",
+                    mlServerMsg);
+            }
 
-        }).detach();
+            if (!safeThis->loadCompedFile(compedFileCopy))
+            {
+                safeThis->onCompingFinished(false);
+                return;
+            }
+
+            safeThis->hasLastCompResult = true;
+            safeThis->lastCompedFile = compedFileCopy;
+            safeThis->lastCompmapFile = compmapFileCopy;
+
+            safeThis->compedTabButton.setEnabled(true);
+            safeThis->updateTabButtonStyles();
+
+            safeThis->onCompingFinished(true);
+
+            if (compmapMissing)
+            {
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon,
+                    "Comping warning",
+                    "Comped audio was created, but the compmap JSON is missing:\n"
+                    + compmapFileCopy.getFullPathName()
+                    + "\n\nThe Comped tab will not show segment boundaries.");
+            }
+
+            juce::String msg;
+
+            if (mlUsed)
+            {
+                msg = "ML comping successful. Model used: BalancedRandomForest.\n"
+                      "Wrote comped audio file to:\n" + compedFileCopy.getFullPathName();
+            }
+            else
+            {
+                msg = "Comping successful.\n"
+                      "Wrote comped audio file to:\n" + compedFileCopy.getFullPathName();
+            }
+
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::AlertWindow::InfoIcon,
+                "Comping complete",
+                msg,
+                "OK",
+                safeThis,
+                juce::ModalCallbackFunction::create([safeThis](int)
+                {
+                    if (!safeThis->loadLastCompForReview())
+                        DBG("CompReview: loadLastCompForReview() failed");
+
+                    safeThis->viewMode = ViewMode::CompReview;
+                    safeThis->updateTabButtonStyles();
+                    safeThis->resized();
+                    safeThis->repaint();
+                }));
+        });
+
+    }).detach();
 }
 
 
@@ -313,72 +452,60 @@ bool MainComponent::loadLastCompForReview()
     DBG("loadLastCompForReview() called");
 
     compSegments.clear();
+    compBoundaries.clear();
+    compmapJsonCache = juce::var();
     hasCompedThumbnail = false;
     compedThumbnail.clear();
 
     if (!hasLastCompResult)
-    {
-        DBG("loadLastCompForReview: hasLastCompResult is false");
         return false;
-    }
 
     if (!lastCompedFile.existsAsFile())
-    {
-        DBG("loadLastCompForReview: lastCompedFile missing: "
-            << lastCompedFile.getFullPathName());
         return false;
-    }
 
     compedThumbnail.setSource(new juce::FileInputSource(lastCompedFile));
     hasCompedThumbnail = (compedThumbnail.getTotalLength() > 0.0);
 
-    if (!hasCompedThumbnail)
-    {
-        DBG("loadLastCompForReview: compedThumbnail total length is zero");
-    }
-
     if (!lastCompmapFile.existsAsFile())
-    {
-        DBG("loadLastCompForReview: lastCompmapFile missing: "
-            << lastCompmapFile.getFullPathName()
-            << " (no segment markers will be shown).");
         return hasCompedThumbnail;
-    }
 
     juce::FileInputStream in(lastCompmapFile);
     if (!in.openedOk())
-    {
-        DBG("loadLastCompForReview: could not open compmap file stream");
         return hasCompedThumbnail;
-    }
 
     auto jsonVar = juce::JSON::parse(in);
     if (jsonVar.isVoid() || !jsonVar.isObject())
-    {
-        DBG("loadLastCompForReview: JSON root is not an object");
         return hasCompedThumbnail;
-    }
+
+    // Cache full compmap JSON so edits won't destroy unrelated fields
+    compmapJsonCache = jsonVar;
 
     auto* rootObj = jsonVar.getDynamicObject();
     if (rootObj == nullptr)
-    {
-        DBG("loadLastCompForReview: JSON root dynamic object is null");
         return hasCompedThumbnail;
+
+    // If compmap stores the default fade_fraction, cache it for fallback defaults
+    {
+        auto xfadeDefaultsVar = rootObj->getProperty("xfade_defaults");
+        if (xfadeDefaultsVar.isObject())
+        {
+            if (auto* xfadeDefaultsObj = xfadeDefaultsVar.getDynamicObject())
+            {
+                auto ffVar = xfadeDefaultsObj->getProperty("fade_fraction");
+                const double ff = (double)ffVar;
+                if (ff > 0.0)
+                    lastCompFadeFraction = ff;
+            }
+        }
     }
 
     auto segmentsVar = rootObj->getProperty("segments");
     if (!segmentsVar.isArray())
-    {
-        DBG("loadLastCompForReview: 'segments' is not an array");
         return hasCompedThumbnail;
-    }
 
     auto* segmentsArray = segmentsVar.getArray();
     if (segmentsArray == nullptr)
-    {
-        DBG("loadLastCompForReview: 'segments' array pointer is null");
         return hasCompedThumbnail;
-    }
 
     for (const auto& segVar : *segmentsArray)
     {
@@ -406,18 +533,15 @@ bool MainComponent::loadLastCompForReview()
                 if (takeNameVar.isString())
                 {
                     juce::String takeName = takeNameVar.toString();
-
                     if (takeName.startsWithIgnoreCase("take_"))
                     {
-                        juce::String numStr =
-                            takeName.fromFirstOccurrenceOf("take_", false, false);
+                        juce::String numStr = takeName.fromFirstOccurrenceOf("take_", false, false);
                         takeIndex = numStr.getIntValue();
                     }
                     else
                     {
                         takeIndex = takeName.getIntValue();
                     }
-
                     if (takeIndex <= 0)
                         takeIndex = -1;
                 }
@@ -428,12 +552,613 @@ bool MainComponent::loadLastCompForReview()
         seg.startSec = startSec;
         seg.endSec = endSec;
         seg.takeIndex = takeIndex;
-
         compSegments.add(seg);
+        
+        sanitizeCompSegments();
+    }
+
+    // Build per-boundary crossfade windows
+    const int numBoundaries = juce::jmax(0, compSegments.size() - 1);
+    compBoundaries.ensureStorageAllocated(numBoundaries);
+
+    auto readDoubleProp = [](juce::DynamicObject* obj, const juce::String& key, double fallback) -> double
+        {
+            if (obj == nullptr)
+                return fallback;
+            auto v = obj->getProperty(key);
+            if (v.isDouble() || v.isInt() || v.isInt64())
+                return (double)v;
+            if (v.isString())
+                return v.toString().getDoubleValue();
+            return fallback;
+        };
+
+    bool loadedBoundaries = false;
+    auto boundariesVar = rootObj->getProperty("boundaries");
+
+    if (boundariesVar.isArray())
+    {
+        if (auto* boundariesArray = boundariesVar.getArray())
+        {
+            if (boundariesArray->size() >= numBoundaries)
+            {
+                bool allOk = true;
+
+                for (int b = 0; b < numBoundaries; ++b)
+                {
+                    auto elem = boundariesArray->getUnchecked(b);
+                    if (!elem.isObject())
+                    {
+                        allOk = false;
+                        break;
+                    }
+
+                    auto* obj = elem.getDynamicObject();
+                    const double boundaryS = compSegments.getReference(b).endSec;
+                    const double leftStart = compSegments.getReference(b).startSec;
+                    const double rightEnd = compSegments.getReference(b + 1).endSec;
+
+                    double xs = readDoubleProp(obj, "xfadeStartSec", boundaryS);
+                    double xe = readDoubleProp(obj, "xfadeEndSec", boundaryS);
+
+                    // Clamp: within segments, and include boundary
+                    xs = juce::jlimit(leftStart, boundaryS, xs);
+                    xe = juce::jlimit(boundaryS, rightEnd, xe);
+
+                    constexpr double minWin = 0.005;
+                    if (xe - xs < minWin)
+                    {
+                        const double half = minWin * 0.5;
+                        xs = boundaryS - half;
+                        xe = boundaryS + half;
+                        xs = juce::jlimit(leftStart, boundaryS, xs);
+                        xe = juce::jlimit(boundaryS, rightEnd, xe);
+                    }
+
+                    CompBoundary cb;
+                    cb.leftSegIndex = b;
+                    cb.xfadeStartSec = xs;
+                    cb.xfadeEndSec = xe;
+                    compBoundaries.add(cb);
+                }
+
+                loadedBoundaries = allOk && (compBoundaries.size() == numBoundaries);
+                if (!loadedBoundaries)
+                    compBoundaries.clear();
+            }
+        }
+    }
+
+    // Backward-compat defaults if boundaries missing/unusable
+    if (!loadedBoundaries)
+    {
+        const double fadeFrac = (lastCompFadeFraction > 0.0) ? lastCompFadeFraction : 0.15;
+        constexpr double minSec = 0.030;
+        constexpr double maxSec = 0.500;
+        constexpr double minWin = 0.005;
+
+        for (int b = 0; b < numBoundaries; ++b)
+        {
+            const auto& left = compSegments.getReference(b);
+            const auto& right = compSegments.getReference(b + 1);
+
+            const double boundaryS = left.endSec;
+            const double d1 = juce::jmax(0.0, left.endSec - left.startSec);
+            const double d2 = juce::jmax(0.0, right.endSec - right.startSec);
+
+            double fadeS = juce::jlimit(minSec, maxSec, juce::jmin(d1, d2) * fadeFrac);
+            fadeS = juce::jmin(fadeS, d1 + d2);
+
+            double xs = boundaryS - fadeS * 0.5;
+            double xe = boundaryS + fadeS * 0.5;
+
+            xs = juce::jmax(xs, left.startSec);
+            xe = juce::jmin(xe, right.endSec);
+
+            // Force include boundary
+            xs = juce::jmin(xs, boundaryS);
+            xe = juce::jmax(xe, boundaryS);
+
+            if (xe - xs < minWin)
+            {
+                const double half = minWin * 0.5;
+                xs = boundaryS - half;
+                xe = boundaryS + half;
+                xs = juce::jlimit(left.startSec, boundaryS, xs);
+                xe = juce::jlimit(boundaryS, right.endSec, xe);
+            }
+
+            CompBoundary cb;
+            cb.leftSegIndex = b;
+            cb.xfadeStartSec = xs;
+            cb.xfadeEndSec = xe;
+            compBoundaries.add(cb);
+        }
     }
 
     DBG("loadLastCompForReview: loaded " << compSegments.size()
-        << " segments, hasCompedThumbnail=" << (int)hasCompedThumbnail);
+        << " segments, boundaries=" << compBoundaries.size());
+
+    prepareCompedAuditionSource();
 
     return hasCompedThumbnail || !compSegments.isEmpty();
+
+}
+
+
+
+bool MainComponent::prepareCompedAuditionSource()
+{
+    hasCompedAuditionSource = false;
+    compedAuditionSource.reset();
+
+    if (compSegments.isEmpty())
+        return false;
+
+    // Collect take_*.wav files for this phrase
+    juce::Array<juce::File> takeFiles;
+    currentPhraseDirectory.findChildFiles(
+        takeFiles, juce::File::findFiles, false, "take_*.wav");
+
+    if (takeFiles.isEmpty())
+        return false;
+
+    // Ensure formats are registered (safe to call multiple times)
+    //formatManager.registerBasicFormats();
+
+    auto src = std::make_unique<CompedAuditionSource>();
+
+    juce::String err;
+    if (!src->loadTakesIntoMemory(formatManager, takeFiles, currentSampleRate, err))
+    {
+        DBG("prepareCompedAuditionSource failed: " + err);
+        return false;
+    }
+
+    // Convert JUCE arrays -> std::vector for the audition source
+    std::vector<CompedAuditionSource::SegmentInfo> segs;
+    segs.reserve((size_t)compSegments.size());
+    for (const auto& s : compSegments)
+    {
+        CompedAuditionSource::SegmentInfo si;
+        si.startSec = s.startSec;
+        si.endSec = s.endSec;
+        si.takeIndex = s.takeIndex;
+        segs.push_back(si);
+    }
+
+    std::vector<CompedAuditionSource::BoundaryInfo> bounds;
+    bounds.reserve((size_t)compBoundaries.size());
+    for (const auto& b : compBoundaries)
+    {
+        CompedAuditionSource::BoundaryInfo bi;
+        bi.leftSegIndex = b.leftSegIndex;
+        bi.xfadeStartSec = b.xfadeStartSec;
+        bi.xfadeEndSec = b.xfadeEndSec;
+        bounds.push_back(bi);
+    }
+
+    src->setCompData(segs, bounds);
+    src->setXFadeCurve(CompedAuditionSource::XFadeCurve::Linear);
+
+    // Attach to takeTransport (replaces the rendered comped WAV for audition)
+    takeTransport.stop();
+    takeTransport.setSource(nullptr);
+    takeReaderSource.reset();        // NOTE: UI checks still reference this (we?ll fix in Step C)
+    selectedTakeIndex = -1;
+    soloTakeIndex = -1;
+
+    takeTransport.setSource(src.get(), 0, nullptr, currentSampleRate);
+    takeTransport.setLooping(true);
+
+    compedAuditionSource = std::move(src);
+    hasCompedAuditionSource = true;
+    return true;
+}
+
+
+void MainComponent::clampBoundaryWindowToSegments(int boundaryIndex)
+{
+    if (boundaryIndex < 0 || boundaryIndex >= compBoundaries.size())
+        return;
+    if (boundaryIndex + 1 >= compSegments.size())
+        return;
+
+    auto& cb = compBoundaries.getReference(boundaryIndex);
+    const auto& left = compSegments.getReference(boundaryIndex);
+    const auto& right = compSegments.getReference(boundaryIndex + 1);
+
+    const double boundaryS = left.endSec;
+    double xs = cb.xfadeStartSec;
+    double xe = cb.xfadeEndSec;
+
+    constexpr double minWin = 0.005;
+
+    if (xe - xs < minWin)
+    {
+        const double half = minWin * 0.5;
+        xs = boundaryS - half;
+        xe = boundaryS + half;
+    }
+
+    const double lo1 = juce::jmin(left.startSec, boundaryS);
+    const double hi1 = juce::jmax(left.startSec, boundaryS);
+    xs = juce::jlimit(lo1, hi1, xs);
+
+    const double lo2 = juce::jmin(boundaryS, right.endSec);
+    const double hi2 = juce::jmax(boundaryS, right.endSec);
+    xe = juce::jlimit(lo2, hi2, xe);
+
+    if (xe - xs < minWin)
+    {
+        const double half = minWin * 0.5;
+        xs = boundaryS - half;
+        xe = boundaryS + half;
+        xs = juce::jlimit(left.startSec, boundaryS, xs);
+        xe = juce::jlimit(boundaryS, right.endSec, xe);
+    }
+
+    cb.xfadeStartSec = xs;
+    cb.xfadeEndSec = xe;
+}
+
+void MainComponent::updateCompedAuditionSourceFromEdits()
+{
+    if (compedAuditionSource == nullptr)
+        return;
+
+    std::vector<CompedAuditionSource::SegmentInfo> segs;
+    segs.reserve((size_t)compSegments.size());
+    for (const auto& s : compSegments)
+    {
+        CompedAuditionSource::SegmentInfo si;
+        si.startSec = s.startSec;
+        si.endSec = s.endSec;
+        si.takeIndex = s.takeIndex;
+        segs.push_back(si);
+    }
+
+    std::vector<CompedAuditionSource::BoundaryInfo> bounds;
+    bounds.reserve((size_t)compBoundaries.size());
+    for (const auto& b : compBoundaries)
+    {
+        CompedAuditionSource::BoundaryInfo bi;
+        bi.leftSegIndex = b.leftSegIndex;
+        bi.xfadeStartSec = b.xfadeStartSec;
+        bi.xfadeEndSec = b.xfadeEndSec;
+        bounds.push_back(bi);
+    }
+
+    compedAuditionSource->setCompData(segs, bounds);
+    compedAuditionSource->setXFadeCurve(CompedAuditionSource::XFadeCurve::Linear);
+}
+
+//==============================================================================
+// Export helpers (Option 2: render CompedAuditionSource directly)
+//==============================================================================
+
+bool MainComponent::buildCompedAuditionSourceForExport(std::unique_ptr<CompedAuditionSource>& outSource,
+                                                       double& outLengthSec,
+                                                       juce::String& outError)
+{
+    outSource.reset();
+    outLengthSec = 0.0;
+    outError.clear();
+
+    if (compSegments.isEmpty())
+    {
+        outError = "No comp segments available.";
+        return false;
+    }
+
+    // Collect take_*.wav files for this phrase
+    juce::Array<juce::File> takeFiles;
+    currentPhraseDirectory.findChildFiles(
+        takeFiles, juce::File::findFiles, false, "take_*.wav");
+
+    if (takeFiles.isEmpty())
+    {
+        outError = "No take_*.wav files found for export.";
+        return false;
+    }
+
+    auto src = std::make_unique<CompedAuditionSource>();
+
+    const double sr = (currentSampleRate > 0.0) ? currentSampleRate : 44100.0;
+
+    if (!src->loadTakesIntoMemory(formatManager, takeFiles, sr, outError))
+        return false;
+
+    // Convert JUCE arrays -> std::vector for the audition source
+    std::vector<CompedAuditionSource::SegmentInfo> segs;
+    segs.reserve((size_t)compSegments.size());
+    for (const auto& s : compSegments)
+    {
+        CompedAuditionSource::SegmentInfo si;
+        si.startSec = s.startSec;
+        si.endSec = s.endSec;
+        si.takeIndex = s.takeIndex;
+        segs.push_back(si);
+    }
+
+    std::vector<CompedAuditionSource::BoundaryInfo> bounds;
+    bounds.reserve((size_t)compBoundaries.size());
+    for (const auto& b : compBoundaries)
+    {
+        CompedAuditionSource::BoundaryInfo bi;
+        bi.leftSegIndex = b.leftSegIndex;
+        bi.xfadeStartSec = b.xfadeStartSec;
+        bi.xfadeEndSec = b.xfadeEndSec;
+        bounds.push_back(bi);
+    }
+
+    src->setCompData(segs, bounds);
+    src->setXFadeCurve(CompedAuditionSource::XFadeCurve::Linear);
+
+    // Compute total length from last segment end
+    outLengthSec = compSegments.getLast().endSec;
+    if (outLengthSec <= 0.0 && compedThumbnail.getTotalLength() > 0.0)
+        outLengthSec = compedThumbnail.getTotalLength();
+
+    if (outLengthSec <= 0.0)
+    {
+        outError = "Could not determine comped length for export.";
+        return false;
+    }
+
+    outSource = std::move(src);
+    return true;
+}
+
+void MainComponent::exportCompedAuditionToFileAsync(const juce::File& targetFile)
+{
+    juce::Component::SafePointer<MainComponent> safeThis(this);
+
+    std::thread([safeThis, targetFile]() mutable
+    {
+        if (safeThis == nullptr)
+            return;
+
+        double lengthSec = 0.0;
+        juce::String err;
+        std::unique_ptr<CompedAuditionSource> src;
+
+        if (!safeThis->buildCompedAuditionSourceForExport(src, lengthSec, err))
+        {
+            juce::MessageManager::callAsync([safeThis, err]()
+            {
+                if (safeThis == nullptr) return;
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon,
+                    "Export failed",
+                    err.isNotEmpty() ? err : "Could not build comped audition source.");
+            });
+            return;
+        }
+
+        const double sr = (safeThis->currentSampleRate > 0.0) ? safeThis->currentSampleRate : 44100.0;
+        const juce::int64 totalSamples = (juce::int64) std::ceil(lengthSec * sr);
+
+        if (totalSamples <= 0)
+        {
+            juce::MessageManager::callAsync([safeThis]()
+            {
+                if (safeThis == nullptr) return;
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon,
+                    "Export failed",
+                    "Export length is zero.");
+            });
+            return;
+        }
+
+        juce::WavAudioFormat wav;
+        juce::File outFile = targetFile;
+        if (outFile.existsAsFile())
+            outFile.deleteFile();
+
+        std::unique_ptr<juce::FileOutputStream> outStream(outFile.createOutputStream());
+        if (outStream == nullptr || !outStream->openedOk())
+        {
+            juce::MessageManager::callAsync([safeThis, outFile]()
+            {
+                if (safeThis == nullptr) return;
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon,
+                    "Export failed",
+                    "Could not create output stream:\n" + outFile.getFullPathName());
+            });
+            return;
+        }
+
+        std::unique_ptr<juce::AudioFormatWriter> writer(
+            wav.createWriterFor(outStream.release(), sr, 1, 16, {}, 0));
+
+        if (writer == nullptr)
+        {
+            juce::MessageManager::callAsync([safeThis]()
+            {
+                if (safeThis == nullptr) return;
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon,
+                    "Export failed",
+                    "Could not create WAV writer.");
+            });
+            return;
+        }
+
+        constexpr int blockSize = 8192;
+        juce::AudioBuffer<float> buffer(1, blockSize);
+        juce::AudioSourceChannelInfo info(&buffer, 0, blockSize);
+
+        src->prepareToPlay(blockSize, sr);
+        src->setNextReadPosition(0);
+
+        juce::int64 written = 0;
+        while (written < totalSamples)
+        {
+            const int numThis = (int) juce::jmin<juce::int64>(blockSize, totalSamples - written);
+            buffer.clear();
+            info.numSamples = numThis;
+
+            src->getNextAudioBlock(info);
+            writer->writeFromAudioSampleBuffer(buffer, 0, numThis);
+
+            written += numThis;
+        }
+
+        src->releaseResources();
+
+        juce::MessageManager::callAsync([safeThis, outFile]()
+        {
+            if (safeThis == nullptr) return;
+            juce::AlertWindow::showMessageBoxAsync(
+                juce::AlertWindow::InfoIcon,
+                "Export successful",
+                "Comped file exported to:\n" + outFile.getFullPathName());
+        });
+    }).detach();
+}
+
+
+
+
+void MainComponent::rebuildCompedFromEditedCompmapAsync()
+{
+    juce::Component::SafePointer<MainComponent> safeThis(this);
+
+    if (!hasLastCompResult)
+        return;
+    if (!lastCompmapFile.existsAsFile())
+        return;
+    if (lastCompedFile.getFullPathName().isEmpty())
+        return;
+
+    juce::File projectRoot = AppPaths::root();
+    if (!projectRoot.isDirectory())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "Comping error",
+            "App root not found:\n" + projectRoot.getFullPathName());
+        return;
+    }
+
+
+
+    juce::File pythonExe = AppPaths::pythonExe();
+
+    if (!pythonExe.existsAsFile())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "Crossfade rebuild error",
+            "Python virtual environment not found at:\n" + pythonExe.getFullPathName());
+        return;
+    }
+
+    juce::File stitchPy = AppPaths::srcDir().getChildFile("stitch_only.py");
+
+    if (!stitchPy.existsAsFile())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "Crossfade rebuild error",
+            "stitch_only.py not found:\n" + stitchPy.getFullPathName());
+        return;
+    }
+
+    juce::StringArray args;
+    args.add(pythonExe.getFullPathName());
+    args.add("-u");  // unbuffered output for reliable capture
+    args.add(stitchPy.getFullPathName());
+    args.add("--compmap_path");
+    args.add(lastCompmapFile.getFullPathName());
+    args.add("--out_comped_path");
+    args.add(lastCompedFile.getFullPathName());
+
+    juce::String cmdLine = AppPaths::buildPythonCommand(args);
+    juce::Logger::writeToLog("rebuildComped CMD: " + cmdLine);
+
+    auto projectRootCopy = projectRoot;
+    auto cmdLineCopy = cmdLine;
+    auto compedCopy = lastCompedFile;
+
+    std::thread([safeThis, projectRootCopy, cmdLineCopy, compedCopy]() mutable
+        {
+            bool success = false;
+            juce::String errorMessage;
+
+            juce::File oldCwd = juce::File::getCurrentWorkingDirectory();
+            projectRootCopy.setAsCurrentWorkingDirectory();
+
+            juce::ChildProcess process;
+            if (!process.start(cmdLineCopy))
+            {
+                errorMessage = "Could not launch Python stitch_only process.\nCommand:\n" + cmdLineCopy;
+                juce::Logger::writeToLog("stitch_only: process.start() FAILED");
+            }
+            else
+            {
+                juce::Logger::writeToLog("stitch_only: process started OK, waiting...");
+
+                const int maxMillis = 120000;
+                const bool finished = process.waitForProcessToFinish(maxMillis);
+
+                juce::String processOutput = process.readAllProcessOutput();
+                juce::uint32 exitCode = process.getExitCode();
+
+                AppPaths::logPythonExecution("stitch_only", cmdLineCopy,
+                    projectRootCopy.getFullPathName(), processOutput, exitCode);
+
+                if (!finished)
+                {
+                    errorMessage = "Stitch-only timed out after "
+                        + juce::String(maxMillis / 1000) + " seconds.";
+                    process.kill();
+                }
+                else if (!compedCopy.existsAsFile())
+                {
+                    errorMessage = "Python finished (exit code " + juce::String((int)exitCode)
+                        + ") but the expected comped file was not found:\n"
+                        + compedCopy.getFullPathName();
+
+                    if (processOutput.isNotEmpty())
+                    {
+                        errorMessage += "\n\n--- Python output ---\n"
+                            + processOutput.substring(0, 1500);
+                    }
+                    else
+                    {
+                        errorMessage += "\n\n(No Python output captured. "
+                            "Check python_debug.log in the app folder for details.)";
+                    }
+                }
+                else
+                {
+                    success = true;
+                }
+            }
+
+            oldCwd.setAsCurrentWorkingDirectory();
+
+            juce::MessageManager::callAsync([safeThis, success, errorMessage, compedCopy]() mutable
+                {
+                    if (safeThis == nullptr)
+                        return;
+
+                    if (!success)
+                    {
+                        juce::AlertWindow::showMessageBoxAsync(
+                            juce::AlertWindow::WarningIcon,
+                            "Crossfade rebuild error",
+                            errorMessage);
+                        return;
+                    }
+
+                    safeThis->loadCompedFile(compedCopy);
+                    safeThis->loadLastCompForReview(); // refresh thumbnail + boundaries
+                    safeThis->repaint();
+                });
+        }).detach();
 }

@@ -1,5 +1,6 @@
 // MainComponent_AudioAndRecording.cpp
 #include "MainComponent.h"
+#include "AppPaths.h"
 
 using int64 = juce::int64;
 
@@ -29,8 +30,11 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
     const int start = bufferToFill.startSample;
     const int num = bufferToFill.numSamples;
 
-    if (takeMixBuffer.getNumSamples() < num)
-        takeMixBuffer.setSize(1, num, false, false, true);
+    if (takeMixBuffer.getNumSamples() < num
+        || takeMixBuffer.getNumChannels() != buffer->getNumChannels())
+    {
+        takeMixBuffer.setSize(buffer->getNumChannels(), num, false, false, true);
+    }
 
     // Recording: grab input before overwriting buffer
     if (isRecording && recordingWriter != nullptr)
@@ -169,7 +173,10 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         }
     }
 
-    if (playTake && takeReaderSource != nullptr)
+    const bool haveTakeSource =
+        (takeReaderSource != nullptr) || (compedAuditionSource != nullptr);
+
+    if (playTake && haveTakeSource)
     {
         takeMixBuffer.clear();
 
@@ -177,13 +184,138 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         takeTransport.getNextAudioBlock(takeInfo);
 
         for (int ch = 0; ch < buffer->getNumChannels(); ++ch)
-            buffer->addFrom(ch, start, takeMixBuffer, 0, 0, num);
+        {
+            const int srcCh = juce::jmin(ch, takeMixBuffer.getNumChannels() - 1);
+            buffer->addFrom(ch, start, takeMixBuffer, srcCh, 0, num);
+        }
     }
 
     // 4) Metronome placeholder
-    if (metronomeOn)
+// === Metronome ===
+    if (metronomeOn && transportSource.isPlaying() && bpm > 0)
     {
-		// FUTURE METRONOME, need quantization to beat grid
+        double sampleRate = currentSampleRate;
+        double secondsPerBeat = 60.0 / bpm;
+        double samplesPerBeat = sampleRate * secondsPerBeat;
+
+        // Offset in samples
+        double gridOffsetSamples = gridOffsetSec * sampleRate;
+
+        // We need to know where we are in absolute time
+        // transportSource.getNextReadPosition() gives the position in the source file
+        int64 currentPos = transportSource.getNextReadPosition();
+
+        // Adjust for the fact that getNextReadPosition() is ahead by bufferToFill.numSamples usually,
+        // but safe to use playhead time. A robust way is:
+        double startSeconds = getPlayheadPositionSec();
+        int64 startSampleInFile = (int64)(startSeconds * sampleRate);
+
+        // Iterate through the buffer to find beat onsets
+        for (int sample = 0; sample < bufferToFill.numSamples; ++sample)
+        {
+            int64 absSample = startSampleInFile + sample;
+
+            // Check distance to nearest beat
+            // We use fmod to find position within the beat cycle
+            double posInBeat = std::fmod((double)absSample - gridOffsetSamples, samplesPerBeat);
+            if (posInBeat < 0) posInBeat += samplesPerBeat;
+
+            // Trigger if we are at the very start of a beat
+            if (posInBeat < 1.0)
+            {
+                // Synthesize a click (simple sine decay)
+                // Ideally you'd trigger a sample, but this is a quick procedural click
+                // We write a few samples into the buffer
+
+                float clickVol = 0.5f;
+                int clickLen = (int)(0.01 * sampleRate); // 10ms click
+
+                // Prevent writing past end of current buffer
+                int writeLen = juce::jmin(clickLen, bufferToFill.numSamples - sample);
+
+                for (int ch = 0; ch < bufferToFill.buffer->getNumChannels(); ++ch)
+                {
+                    auto* channelData = bufferToFill.buffer->getWritePointer(ch, bufferToFill.startSample + sample);
+                    for (int i = 0; i < writeLen; ++i)
+                    {
+                        // 1kHz tone
+                        float val = (float)std::sin(i * 0.15);
+                        channelData[i] += val * clickVol;
+                    }
+                }
+            }
+        }
+    }
+}
+
+bool MainComponent::isSoloPlayback() const
+{
+    if (viewMode == ViewMode::Recording)
+        return (soloTakeIndex >= 0);
+    if (viewMode == ViewMode::CompReview)
+        return compedSolo;
+    return false;
+}
+
+double MainComponent::getPlayheadPositionSec() const
+{
+    // Solo mode -> use take transport time
+    if (isSoloPlayback())
+        return loopStartSec + takeTransport.getCurrentPosition();
+
+    // Normal mode -> use instrumental time if playing
+    if (transportSource.isPlaying())
+        return transportSource.getCurrentPosition();
+
+    // If only take is playing (no instrumental)
+    if (takeTransport.isPlaying())
+        return loopStartSec + takeTransport.getCurrentPosition();
+
+    return 0.0;
+}
+
+void MainComponent::startPlaybackForSelection(bool playInstrumental, bool playTake)
+{
+    const bool loop = hasValidLoop();
+    const double startSec = loop ? loopStartSec : 0.0;
+
+    if (playInstrumental && readerSource != nullptr)
+    {
+        transportSource.setPosition(startSec);
+        transportSource.start();
+    }
+    else
+    {
+        transportSource.stop();
+    }
+
+    if (playTake && (takeReaderSource != nullptr || compedAuditionSource != nullptr))
+    {
+        takeTransport.setPosition(0.0); // takes are aligned to loop
+        takeTransport.start();
+    }
+    else
+    {
+        takeTransport.stop();
+    }
+}
+
+void MainComponent::stopAllPlayback()
+{
+    transportSource.stop();
+    takeTransport.stop();
+}
+
+void MainComponent::enforceLoopWrap()
+{
+    if (!hasValidLoop())
+        return;
+
+    const double pos = getPlayheadPositionSec();
+    if (pos >= loopEndSec)
+    {
+        transportSource.setPosition(loopStartSec);
+        takeTransport.setPosition(0.0);
     }
 }
 
@@ -401,30 +533,20 @@ void MainComponent::setSelectedTake(int newIndex)
         repaint();
         return;
     }
-
+    
+    
+    const double fileSR = reader->sampleRate;
     auto* rawReader = reader.release();
     takeReaderSource = std::make_unique<juce::AudioFormatReaderSource>(rawReader, true);
 
-    takeTransport.setSource(takeReaderSource.get(),
-        0,
-        nullptr,
-        currentSampleRate);
+    takeTransport.setSource(takeReaderSource.get(), 0, nullptr, fileSR);
 
     takeTransport.setLooping(true);
 
     selectedTakeIndex = newIndex;
 
-    if (transportSource.isPlaying() && hasValidLoop())
-    {
-        transportSource.setPosition(loopStartSec);
-        takeTransport.setPosition(0.0);
-        takeTransport.start();
-    }
-    else if (readerSource == nullptr)
-    {
-        takeTransport.setPosition(0.0);
-        takeTransport.start();
-    }
+    // Select → play take + instrumental immediately
+    startPlaybackForSelection(true, true);
 
     refreshTakeLaneSelectionStates();
     repaint();
@@ -466,29 +588,18 @@ void MainComponent::setSoloTake(int newIndex)
         return;
     }
 
+    const double fileSR = reader->sampleRate;
     auto* rawReader = reader.release();
     takeReaderSource = std::make_unique<juce::AudioFormatReaderSource>(rawReader, true);
 
-    takeTransport.setSource(takeReaderSource.get(),
-        0,
-        nullptr,
-        currentSampleRate);
+    takeTransport.setSource(takeReaderSource.get(), 0, nullptr, fileSR);
 
     takeTransport.setLooping(true);
 
     soloTakeIndex = newIndex;
 
-    if (transportSource.isPlaying() && hasValidLoop())
-    {
-        transportSource.setPosition(loopStartSec);
-        takeTransport.setPosition(0.0);
-        takeTransport.start();
-    }
-    else if (readerSource == nullptr)
-    {
-        takeTransport.setPosition(0.0);
-        takeTransport.start();
-    }
+    // Solo → play take only immediately
+    startPlaybackForSelection(false, true);
 
     refreshTakeLaneSelectionStates();
     repaint();
@@ -548,7 +659,8 @@ void MainComponent::importInstrumental()
             loopEndSec = totalLengthSec;
             minLoopLengthSec = juce::jmin(5.0, totalLengthSec);
 
-            promptForBpm();
+            if (!bpmSet)
+                promptForBpm();
 
             playButton.setEnabled(true);
             stopButton.setEnabled(true);
@@ -566,8 +678,7 @@ void MainComponent::importInstrumental()
 
 void MainComponent::importTakesFromFiles()
 {
-    if (!bpmSet)
-        promptForBpm();
+    
 
     if (isRecording)
         return;
@@ -688,6 +799,9 @@ void MainComponent::importTakesFromFiles()
             takeReaderSource.reset();
             selectedTakeIndex = -1;
             soloTakeIndex = -1;
+        
+            if (!bpmSet)
+                promptForBpm();
 
             juce::File baseDir = currentPhraseDirectory;
             baseDir.createDirectory();
@@ -716,29 +830,10 @@ void MainComponent::importTakesFromFiles()
 
 void MainComponent::initialiseUserPhraseDirectory()
 {
-    juce::File exeDir = juce::File::getSpecialLocation(juce::File::currentExecutableFile)
-        .getParentDirectory();
-
-    juce::File projectRoot = exeDir;
-    const juce::String wantedRootName{ "Vocal Comping Tool" };
-
-    while (!projectRoot.isRoot()
-        && projectRoot.getFileName() != wantedRootName)
-    {
-        auto parent = projectRoot.getParentDirectory();
-        if (parent == projectRoot)
-            break;
-
-        projectRoot = parent;
-    }
-
-    if (projectRoot.getFileName() != wantedRootName)
-    {
-        projectRoot = exeDir.getParentDirectory().getParentDirectory();
-    }
-
-    juce::File dataPilotDir = projectRoot.getChildFile("data_pilot");
-    juce::File singerDir = dataPilotDir.getChildFile("singer_user");
+    // Always use exe folder root (Windows/Linux) / Resources (mac)
+    auto projectRoot = AppPaths::root();
+    auto dataPilotDir = AppPaths::dataPilotDir();
+    auto singerDir = AppPaths::singerUserDir();
 
     dataPilotDir.createDirectory();
     singerDir.createDirectory();
@@ -748,8 +843,7 @@ void MainComponent::initialiseUserPhraseDirectory()
 
     for (int idx = 1; idx <= maxPhrases; ++idx)
     {
-        const juce::String phraseName = "phrase"
-            + juce::String(idx).paddedLeft('0', 2);
+        const juce::String phraseName = "phrase" + juce::String(idx).paddedLeft('0', 2);
         juce::File phraseDir = singerDir.getChildFile(phraseName);
 
         bool useThis = false;
@@ -761,13 +855,9 @@ void MainComponent::initialiseUserPhraseDirectory()
         }
         else
         {
-            bool hasFiles = false;
+            // Use if empty
             juce::DirectoryIterator it(phraseDir, false, "*", juce::File::findFiles);
-
-            if (it.next())
-                hasFiles = true;
-
-            if (!hasFiles)
+            if (!it.next())
                 useThis = true;
         }
 
@@ -834,7 +924,11 @@ void MainComponent::rebuildTakesFromPhraseDirectory()
     if (takeFiles.isEmpty())
         return;
 
-    takeFiles.sort(TakeFileComparator(), true);
+    // Create the instance first
+    TakeFileComparator comparator;
+
+    // Pass the instance by reference
+    takeFiles.sort(comparator, true);
 
     std::unique_ptr<juce::AudioFormatReader> firstReader(
         formatManager.createReaderFor(takeFiles[0]));

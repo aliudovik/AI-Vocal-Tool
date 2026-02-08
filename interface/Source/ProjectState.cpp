@@ -1,5 +1,53 @@
 // ProjectState.cpp
 #include "ProjectState.h"
+#include "AppPaths.h"
+
+//==============================================================================
+// Helpers
+//==============================================================================
+
+static juce::String resolvePath(const juce::String& p, const juce::File& projectRoot)
+{
+    if (p.isEmpty())
+        return {};
+
+#if JUCE_WINDOWS
+    // If someone saved "/data_pilot/..." or "\data_pilot\..." treat it as RELATIVE to projectRoot,
+    // not as "C:\data_pilot".
+    const bool looksLikeDriveRootRelative =
+        (p.startsWithChar('/') || p.startsWithChar('\\')) && !p.startsWith("\\\\"); // keep UNC absolute
+
+    if (looksLikeDriveRootRelative)
+    {
+        juce::String rel = p.trimCharactersAtStart("/\\");
+        return projectRoot.getChildFile(rel).getFullPathName();
+    }
+#endif
+
+    if (juce::File::isAbsolutePath(p))
+        return juce::File(p).getFullPathName();
+
+    return projectRoot.getChildFile(p).getFullPathName();
+}
+
+
+
+static juce::String makeRelativePath(const juce::String& p, const juce::File& projectRoot)
+{
+    if (p.isEmpty()) return {};
+
+    if (!juce::File::isAbsolutePath(p))
+        return p;
+
+    juce::File f(p);
+
+    // Only store relative if it is inside the app root
+    if (f.isAChildOf(projectRoot))
+        return f.getRelativePathFrom(projectRoot);
+
+    // Otherwise keep absolute (e.g. user picked an instrumental somewhere else)
+    return f.getFullPathName();
+}
 
 //==============================================================================
 // CompSegmentState
@@ -26,6 +74,31 @@ CompSegmentState CompSegmentState::fromVar(const juce::var& v)
     }
 
     return s;
+}
+
+//==============================================================================
+// CompBoundaryState
+//==============================================================================
+
+juce::var CompBoundaryState::toVar() const
+{
+    auto* obj = new juce::DynamicObject();
+    obj->setProperty("leftSegIndex", leftSegIndex);
+    obj->setProperty("xfadeStartSec", xfadeStartSec);
+    obj->setProperty("xfadeEndSec", xfadeEndSec);
+    return obj;
+}
+
+CompBoundaryState CompBoundaryState::fromVar(const juce::var& v)
+{
+    CompBoundaryState b;
+    if (auto* obj = v.getDynamicObject())
+    {
+        if (obj->hasProperty("leftSegIndex"))  b.leftSegIndex = (int)obj->getProperty("leftSegIndex");
+        if (obj->hasProperty("xfadeStartSec")) b.xfadeStartSec = (double)obj->getProperty("xfadeStartSec");
+        if (obj->hasProperty("xfadeEndSec"))   b.xfadeEndSec = (double)obj->getProperty("xfadeEndSec");
+    }
+    return b;
 }
 
 //==============================================================================
@@ -82,10 +155,17 @@ juce::var ProjectState::toVar() const
         segs.add(s.toVar());
     root->setProperty("compSegments", segs);
 
+    root->setProperty("gridOffsetSec", gridOffsetSec);
+
+    juce::Array<juce::var> bounds;
+    for (const auto& b : compBoundaries)
+        bounds.add(b.toVar());
+    root->setProperty("compBoundaries", bounds);
+
     return root;
 }
 
-ProjectState ProjectState::fromVar(const juce::var& v)
+ProjectState ProjectState::fromVar(const juce::var& v, const juce::File& projectRoot)
 {
     ProjectState s;
 
@@ -93,7 +173,7 @@ ProjectState ProjectState::fromVar(const juce::var& v)
     {
         if (root->hasProperty("version"))            s.version = (int)root->getProperty("version");
 
-        s.instrumentalPath = root->getProperty("instrumentalPath").toString();
+        s.instrumentalPath = resolvePath(root->getProperty("instrumentalPath").toString(), projectRoot);
         s.loopStartSec = (double)root->getProperty("loopStartSec");
         s.loopEndSec = (double)root->getProperty("loopEndSec");
         s.loopLocked = (bool)root->getProperty("loopLocked");
@@ -104,7 +184,7 @@ ProjectState ProjectState::fromVar(const juce::var& v)
         s.metronomeOn = (bool)root->getProperty("metronomeOn");
 
         s.currentPhraseIndex = (int)root->getProperty("currentPhraseIndex");
-        s.currentPhraseDirectory = root->getProperty("currentPhraseDirectory").toString();
+        s.currentPhraseDirectory = resolvePath(root->getProperty("currentPhraseDirectory").toString(), projectRoot);
 
         s.fullRecordingIndex = (int)root->getProperty("fullRecordingIndex");
         s.nextTakeIndex = (int)root->getProperty("nextTakeIndex");
@@ -114,8 +194,8 @@ ProjectState ProjectState::fromVar(const juce::var& v)
         s.takeVolume = (double)root->getProperty("takeVolume");
 
         s.hasLastCompResult = (bool)root->getProperty("hasLastCompResult");
-        s.lastCompedFilePath = root->getProperty("lastCompedFilePath").toString();
-        s.lastCompmapFilePath = root->getProperty("lastCompmapFilePath").toString();
+        s.lastCompedFilePath = resolvePath(root->getProperty("lastCompedFilePath").toString(), projectRoot);
+        s.lastCompmapFilePath = resolvePath(root->getProperty("lastCompmapFilePath").toString(), projectRoot);
         s.lastCompAlphaPct = (int)root->getProperty("lastCompAlphaPct");
         s.lastCompCrossfadePct = (int)root->getProperty("lastCompCrossfadePct");
         s.lastCompFadeFraction = (double)root->getProperty("lastCompFadeFraction");
@@ -133,9 +213,27 @@ ProjectState ProjectState::fromVar(const juce::var& v)
                     s.compSegments.add(CompSegmentState::fromVar(item));
             }
         }
+
+        s.gridOffsetSec = (double)root->getProperty("gridOffsetSec");
+
+        auto boundsVar = root->getProperty("compBoundaries");
+        if (boundsVar.isArray())
+        {
+            if (auto* arr = boundsVar.getArray())
+            {
+                for (const auto& item : *arr)
+                    s.compBoundaries.add(CompBoundaryState::fromVar(item));
+            }
+        }
     }
 
     return s;
+}
+
+ProjectState ProjectState::fromVar(const juce::var& v)
+{
+    juce::File projectRoot = AppPaths::root();
+    return fromVar(v, projectRoot);
 }
 
 bool ProjectState::saveToFile(const ProjectState& state,
@@ -144,7 +242,16 @@ bool ProjectState::saveToFile(const ProjectState& state,
 {
     errorMessage.clear();
 
-    juce::var root = state.toVar();
+    juce::File projectRoot = AppPaths::root();
+
+    // Make a temporary copy with relative paths
+    ProjectState tmp = state;
+    tmp.instrumentalPath      = makeRelativePath(state.instrumentalPath, projectRoot);
+    tmp.currentPhraseDirectory = makeRelativePath(state.currentPhraseDirectory, projectRoot);
+    tmp.lastCompedFilePath    = makeRelativePath(state.lastCompedFilePath, projectRoot);
+    tmp.lastCompmapFilePath   = makeRelativePath(state.lastCompmapFilePath, projectRoot);
+
+    juce::var root = tmp.toVar();
     const auto json = juce::JSON::toString(root, true);
 
     std::unique_ptr<juce::FileOutputStream> out(file.createOutputStream());
@@ -190,6 +297,7 @@ bool ProjectState::loadFromFile(ProjectState& state,
         return false;
     }
 
-    state = ProjectState::fromVar(parsed);
+    juce::File projectRoot = AppPaths::root();
+    state = ProjectState::fromVar(parsed, projectRoot);
     return true;
 }
