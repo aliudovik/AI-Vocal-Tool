@@ -6,6 +6,8 @@ One-button vocal comping app that helps singers record multiple takes on a loop 
 
 ---
 
+**Status:** v0.1.0-alpha — first public build
+
 ## What it does
 
 Traditional comping in a DAW is powerful but slow: record takes, manually slice phrases, audition, crossfade, and assemble. **AI Vocal Comp** compresses that workflow into a fast loop:
@@ -17,7 +19,8 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 5. App **auto-pads + splits** the recording into loop-sized takes
 6. A reference take is **segmented** into musical phrase chunks
 7. The same boundaries are reused across all takes
-8. Python magic (segments ranking)
+8. Segment scoring / ranking (heuristic + optional ML ranker)
+9. Manual boundary adjustment and crossfading
 10. **Export** the comped result
 
 <img width="1920" height="1002" alt="main_interface" src="https://github.com/user-attachments/assets/fcef7313-2801-408b-b6fe-252ad5248bd7" />
@@ -29,10 +32,12 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 ## Key features
 
 - **One-button loop recording:** record continuously inside IN/OUT and stop anytime.
-- **Auto-padding + deterministic take splitting:** on stop, audio is padded to the loop length and split into take-sized regions (no manual trimming).
-- **Musical segmentation (Python):** BPM-aware segmentation that prefers **low-energy RMS valleys** to avoid cutting sustained vowels.
-- **Per-segment audition + selection:** quickly audition takes segment-by-segment.
-- **Export selected comp** to a single audio file.
+- **Auto-padding + deterministic take splitting:** on stop, audio is padded to the loop length and split into take-sized regions.
+- **Musical segmentation (Python):** BPM-aware segmentation that prefers low-energy RMS valleys to avoid cutting sustained vowels.
+- **Manual segmentation point adjustment:** drag green boundary markers on the comping tab to refine phrase boundaries.
+- **Per-segment audition + selection.**
+- **Manual crossfades on the comping tab** (linear crossfade, alpha implementation).
+- **Export selected comp** to a single WAV file.
 
 ---
 
@@ -50,6 +55,29 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
   - Segment scoring / ranking; writing to a compmap json
   - Stitching from the compmap
 
+- **Python ML-server**
+  - Applies the model specified below to rank the takes (optional)
+ 
+### Machine learning (optional ranker)
+
+The current experimental ranker is trained using a **Balanced Random Forest** model.
+During development, the following models and configurations were evaluated:
+
+- Random Forest
+- Balanced Random Forest (final choice)
+- Extra Trees
+- XGBoost
+- SVM  
+  (with balanced and unbalanced dataset variants and systematic sweeps over
+  `n_estimators`, `max_depth` and `min_samples_leaf`).
+
+The training dataset was **self-collected** and consists of multiple real vocal takes of
+*Jingle Bells* and *Happy Birthday* melodies, with light data augmentation to achieve class balance.
+
+Detailed training procedure, model comparisons and evaluation results are documented in:
+
+`ml/ML_info.md`
+
 Repository structure:
 
 ```
@@ -64,6 +92,9 @@ AI-Vocal-Comp/
   interface/
     AI-Comp-Interface.jucer
     Source/
+      AppPaths.h
+      CompedAuditionSource.h
+      CompedAuditionSource.cpp
       Main.cpp
       MainComponent.cpp
       MainComponent.h
@@ -76,6 +107,7 @@ AI-Vocal-Comp/
       NeonUI.h
       ProjectState.cpp
       ProjectState.h
+      
 
   python/
     extract_features.py
@@ -85,14 +117,9 @@ AI-Vocal-Comp/
     scoring.py
     segmentation.py
     stitch_from_compmap.py
-
-  scripts/
-    apply_ranker.py
-    build_pairs.py
-    train_ranker_sklearn.py
-
-  models/
-    ranker_sklearn.joblib        # optional (use LFS if big)
+    stitch_only.py
+    compmap_utils.py
+    xfade_test.py
 
   assets/
     screenshots/
@@ -153,14 +180,17 @@ https://vocalcomping.pythonanywhere.com/
 ## Results
 
 In my test scenario (18 takes), this workflow was **~21× faster** than manual slicing/comping. In typical sessions, it should be **10×+ faster** depending on song length and take count.
+PC Specs upon testing: Core i7-12700k; 16GB DDR5 4800mhz; PCIe 4.0 NVMe SSD.
 
 ---
 
 ## Roadmap
 
-- Manual crossfade editor per boundary (cleaner transitions)
-- ML-based scoring for emotion/accuracy understanding
-- Quantization / timing alignment features
+- Key-based support for improved phrase alignment and song structure awareness.
+- Improved manual crossfades:
+  - adjustable crossfade curvature (non-linear shapes),
+  - ability to move entire segments, not only boundary connection points.
+- Fully manual segmentation mode for precise, user-defined phrase boundaries.
 
 ---
 
