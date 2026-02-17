@@ -153,6 +153,121 @@ def _find_rms_valleys(
     return np.asarray(keep_times, dtype=np.float32), np.asarray(keep_vals, dtype=np.float32)
 
 
+def _find_quiet_regions(
+    rms,
+    times,
+    quiet_percentile=35.0,
+    quiet_cap=0.70,
+    smooth_win=7,
+):
+    """
+    Detect contiguous low-RMS regions.
+
+    Returns:
+        list[dict] with keys:
+          start_t, end_t, duration, min_t, min_rms
+    """
+    n = len(rms)
+    if n == 0 or len(times) != n:
+        return []
+
+    max_r = float(rms.max()) if n > 0 else 0.0
+    rms_norm = (rms / max_r) if max_r > 0 else rms.astype(np.float32)
+    env = _smooth_1d(rms_norm, smooth_win)
+
+    quiet_thresh = float(np.percentile(env, float(quiet_percentile)))
+    quiet_thresh = min(quiet_thresh, float(quiet_cap))
+
+    if n > 1:
+        frame_dt = float(np.median(np.diff(times)))
+    else:
+        frame_dt = 0.0
+    frame_dt = max(0.0, frame_dt)
+
+    quiet_mask = env <= quiet_thresh
+    regions = []
+    i = 0
+    while i < n:
+        if not quiet_mask[i]:
+            i += 1
+            continue
+
+        j = i
+        while j + 1 < n and quiet_mask[j + 1]:
+            j += 1
+
+        window = env[i : j + 1]
+        rel_min = int(np.argmin(window))
+        min_idx = i + rel_min
+
+        start_t = float(times[i])
+        end_t = float(times[j])
+        duration = max(0.0, (end_t - start_t) + frame_dt)
+        regions.append(
+            {
+                "start_t": start_t,
+                "end_t": end_t,
+                "duration": duration,
+                "min_t": float(times[min_idx]),
+                "min_rms": float(env[min_idx]),
+            }
+        )
+
+        i = j + 1
+
+    return regions
+
+
+def _classify_and_select_boundaries(
+    quiet_regions,
+    dur,
+    max_breath_dur,
+    min_spacing=0.15,
+    edge_pad=0.03,
+):
+    """
+    Select boundary points from short quiet regions only.
+    Long quiet regions are treated as intentional silence and are not split.
+    """
+    short_candidates = []
+    short_count = 0
+    long_count = 0
+
+    for r in quiet_regions:
+        reg_dur = float(r["duration"])
+        min_t = float(r["min_t"])
+        min_rms = float(r["min_rms"])
+
+        if min_t < float(edge_pad) or min_t > float(dur) - float(edge_pad):
+            continue
+
+        if reg_dur < float(max_breath_dur):
+            short_count += 1
+            short_candidates.append((min_t, min_rms))
+        else:
+            long_count += 1
+
+    if not short_candidates:
+        return np.zeros(0, dtype=np.float32), short_count, long_count
+
+    short_candidates.sort(key=lambda x: x[0])
+
+    keep = []
+    for t, r in short_candidates:
+        if not keep:
+            keep.append([t, r])
+            continue
+
+        if (t - keep[-1][0]) < float(min_spacing):
+            if r < keep[-1][1]:
+                keep[-1] = [t, r]
+        else:
+            keep.append([t, r])
+
+    keep_times = np.asarray([k[0] for k in keep], dtype=np.float32)
+    return keep_times, short_count, long_count
+
+
 def _choose_boundaries_greedy(
     valley_times,
     dur,
@@ -358,62 +473,93 @@ def segment_phrase_reference(
             beat_period = 60.0 / float(bpm)
             eff_min_seg_dur = min(float(min_seg_dur), max(0.25, 0.90 * beat_period))
             target_seg_dur = max(eff_min_seg_dur, min(4.0, 2.0 * beat_period))
-            valley_min_spacing = min(0.18, 0.40 * beat_period)
+            valley_min_spacing = min(0.15, 0.35 * beat_period)
+            max_breath_dur = max(0.4, min(1.5, min(1.0, 2.0 * beat_period)))
         else:
             eff_min_seg_dur = float(min_seg_dur)
             target_seg_dur = 1.2
-            valley_min_spacing = 0.18
+            valley_min_spacing = 0.15
+            max_breath_dur = 0.8
 
         _log(
             fh,
             f"params eff_min_seg_dur={eff_min_seg_dur:.3f} target_seg_dur={target_seg_dur:.3f} "
             f"max_seg_dur={float(max_seg_dur):.3f} valley_min_spacing={valley_min_spacing:.3f} "
-            f"dp_budget={float(time_budget):.2f}s",
+            f"max_breath_dur={float(max_breath_dur):.3f} dp_budget={float(time_budget):.2f}s",
         )
 
-        valley_times, valley_vals = _find_rms_valleys(
+        quiet_regions = _find_quiet_regions(
             rms,
             rms_times,
-            min_spacing=valley_min_spacing,
-            valley_percentile=35.0,
-            quiet_cap=0.75,
+            quiet_percentile=35.0,
+            quiet_cap=0.70,
             smooth_win=7,
         )
-        _log(fh, f"valleys={int(valley_times.size)}")
+        _log(fh, f"quiet_regions={len(quiet_regions)}")
 
-        if valley_times.size == 0:
-            _log(fh, "no valleys -> one segment")
-            return [(0.0, dur)]
-
-        cand_times = np.concatenate(
-            [np.asarray([0.0], dtype=np.float32), valley_times, np.asarray([dur], dtype=np.float32)]
+        boundary_core, short_regions, long_regions = _classify_and_select_boundaries(
+            quiet_regions=quiet_regions,
+            dur=dur,
+            max_breath_dur=max_breath_dur,
+            min_spacing=valley_min_spacing,
+            edge_pad=0.03,
         )
-        cand_vals = np.concatenate(
-            [np.asarray([1.0], dtype=np.float32), valley_vals, np.asarray([1.0], dtype=np.float32)]
-        )
-        _log(fh, f"candidates={len(cand_times)}")
-
-        boundaries = _choose_boundaries_dp(
-            cand_times=cand_times,
-            cand_valley_rms=cand_vals,
-            min_seg_dur=eff_min_seg_dur,
-            target_seg_dur=target_seg_dur,
-            max_seg_dur=float(max_seg_dur),
-            max_edge_dur=max(float(max_seg_dur) + 0.75 * float(target_seg_dur), 8.0),
-            time_budget_sec=float(time_budget),
-            debug_fh=fh,
+        _log(
+            fh,
+            f"short_regions={int(short_regions)} long_regions={int(long_regions)} "
+            f"boundary_core={int(boundary_core.size)}",
         )
 
-        if boundaries is None:
-            _log(fh, "dp aborted -> greedy fallback")
-            boundaries = _choose_boundaries_greedy(
-                valley_times=valley_times,
-                dur=dur,
+        if boundary_core.size > 0:
+            boundaries = [0.0] + [float(t) for t in boundary_core] + [float(dur)]
+        else:
+            _log(fh, "region path produced no boundaries -> DP fallback")
+            valley_times, valley_vals = _find_rms_valleys(
+                rms,
+                rms_times,
+                min_spacing=valley_min_spacing,
+                valley_percentile=35.0,
+                quiet_cap=0.75,
+                smooth_win=7,
+            )
+            _log(fh, f"fallback valleys={int(valley_times.size)}")
+
+            if valley_times.size == 0:
+                _log(fh, "no fallback valleys -> one segment")
+                return [(0.0, dur)]
+
+            cand_times = np.concatenate(
+                [np.asarray([0.0], dtype=np.float32), valley_times, np.asarray([dur], dtype=np.float32)]
+            )
+            cand_vals = np.concatenate(
+                [np.asarray([1.0], dtype=np.float32), valley_vals, np.asarray([1.0], dtype=np.float32)]
+            )
+            _log(fh, f"fallback candidates={len(cand_times)}")
+
+            boundaries = _choose_boundaries_dp(
+                cand_times=cand_times,
+                cand_valley_rms=cand_vals,
                 min_seg_dur=eff_min_seg_dur,
                 target_seg_dur=target_seg_dur,
                 max_seg_dur=float(max_seg_dur),
+                max_edge_dur=max(float(max_seg_dur) + 0.75 * float(target_seg_dur), 8.0),
+                time_budget_sec=float(time_budget),
+                debug_fh=fh,
             )
 
+            if boundaries is None:
+                _log(fh, "dp aborted -> greedy fallback")
+                boundaries = _choose_boundaries_greedy(
+                    valley_times=valley_times,
+                    dur=dur,
+                    min_seg_dur=eff_min_seg_dur,
+                    target_seg_dur=target_seg_dur,
+                    max_seg_dur=float(max_seg_dur),
+                )
+
+        boundaries = sorted(float(b) for b in boundaries)
+        if not boundaries or boundaries[0] > 1e-3:
+            boundaries = [0.0] + boundaries
         if boundaries[-1] < dur - 1e-3:
             boundaries.append(float(dur))
 
@@ -437,12 +583,6 @@ def segment_phrase_reference(
         if not segments:
             _log(fh, "no segments after merge -> one phrase")
             return one_phrase(y, sr)
-
-        # UI SPEED CAP: high BPM makes too many segments -> slow JUCE comp tab render
-        if bpm and bpm > 140 and len(segments) > 8:
-            _log(fh, f"UI cap: {len(segments)} segs -> 8 (bpm={bpm})")
-            segments = segments[:8]
-            segments[-1] = (segments[-1][0], dur)  # extend last to phrase end
 
         t_all1 = time.time()
         _log(fh, f"done: segments={len(segments)} elapsed={(t_all1 - t_all0):.3f}s")

@@ -3,9 +3,67 @@
 
 namespace AppPaths
 {
-    // Root = folder where the .exe lives (Windows/Linux).
-    // (Optional macOS Resources handling included but harmless elsewhere)
-    inline juce::File root()
+    inline bool looksLikeDevRoot(const juce::File& dir)
+    {
+        if (!dir.isDirectory())
+            return false;
+
+        return dir.getChildFile("interface").isDirectory()
+            && dir.getChildFile("src").isDirectory()
+            && dir.getChildFile("ml").isDirectory()
+            && dir.getChildFile("data_pilot").isDirectory()
+            && dir.getChildFile(".venv").isDirectory();
+    }
+
+    inline juce::File findDevRootFrom(const juce::File& start)
+    {
+        juce::File dir = start.isDirectory() ? start : start.getParentDirectory();
+
+        while (dir.isDirectory())
+        {
+            if (looksLikeDevRoot(dir))
+                return dir;
+
+            if (dir.isRoot())
+                break;
+
+            auto parent = dir.getParentDirectory();
+            if (parent == dir)
+                break;
+
+            dir = parent;
+        }
+
+        return {};
+    }
+
+    inline bool looksLikePackagedRoot(const juce::File& dir)
+    {
+        if (!dir.isDirectory())
+            return false;
+
+        if (!dir.getChildFile("ml").isDirectory()
+            || !dir.getChildFile("src").isDirectory()
+            || !dir.getChildFile("data_pilot").isDirectory())
+            return false;
+
+        auto pyRoot = dir.getChildFile("python");
+        if (!pyRoot.isDirectory())
+            return false;
+
+#if JUCE_WINDOWS
+        return pyRoot.getChildFile("python.exe").existsAsFile();
+#else
+        auto py3 = pyRoot.getChildFile("bin").getChildFile("python3");
+        if (py3.existsAsFile())
+            return true;
+
+        auto py = pyRoot.getChildFile("bin").getChildFile("python");
+        return py.existsAsFile();
+#endif
+    }
+
+    inline juce::File packagedRootFromExecutable()
     {
         auto exe = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
 
@@ -21,32 +79,88 @@ namespace AppPaths
         return exe.getParentDirectory();
     }
 
+    inline juce::File root()
+    {
+        static juce::File cachedRoot = []()
+        {
+            // 1) Prefer packaged layout when the executable sits in the distribution root.
+            auto packagedRoot = packagedRootFromExecutable();
+            if (looksLikePackagedRoot(packagedRoot))
+                return packagedRoot;
+
+            // 2) Prefer repository root when running in development.
+            auto fromExe = findDevRootFrom(juce::File::getSpecialLocation(juce::File::currentExecutableFile));
+            if (fromExe.isDirectory())
+                return fromExe;
+
+            auto fromCwd = findDevRootFrom(juce::File::getCurrentWorkingDirectory());
+            if (fromCwd.isDirectory())
+                return fromCwd;
+
+            auto fromSource = findDevRootFrom(juce::File(juce::String(__FILE__)));
+            if (fromSource.isDirectory())
+                return fromSource;
+
+            // 3) Fall back to executable parent even if structure is partial.
+            return packagedRoot;
+        }();
+
+        return cachedRoot;
+    }
+
     inline juce::File dataPilotDir() { return root().getChildFile("data_pilot"); }
     inline juce::File singerUserDir() { return dataPilotDir().getChildFile("singer_user"); }
+    inline juce::File workingDataDir() { return singerUserDir(); }
     inline juce::File srcDir() { return root().getChildFile("src"); }
     inline juce::File mlDir() { return root().getChildFile("ml"); }
     inline juce::File configsDir() { return root().getChildFile("configs"); }
-    inline juce::File pythonDir() { return root().getChildFile("python"); }
+    inline juce::File pythonDir()
+    {
+        auto venv = root().getChildFile(".venv");
+        if (venv.isDirectory())
+            return venv;
+
+        return root().getChildFile("python");
+    }
 
     inline juce::File pythonExe()
     {
+        auto venv = root().getChildFile(".venv");
+        if (venv.isDirectory())
+        {
 #if JUCE_WINDOWS
-        return pythonDir().getChildFile("python.exe");
+            auto py = venv.getChildFile("Scripts").getChildFile("python.exe");
+            if (py.existsAsFile()) return py;
 #else
-        auto py3 = pythonDir().getChildFile("bin").getChildFile("python3");
+            auto py3 = venv.getChildFile("bin").getChildFile("python3");
+            if (py3.existsAsFile()) return py3;
+
+            auto py = venv.getChildFile("bin").getChildFile("python");
+            if (py.existsAsFile()) return py;
+#endif
+        }
+
+        auto bundledPython = root().getChildFile("python");
+#if JUCE_WINDOWS
+        return bundledPython.getChildFile("python.exe");
+#else
+        auto py3 = bundledPython.getChildFile("bin").getChildFile("python3");
         if (py3.existsAsFile()) return py3;
-        return pythonDir().getChildFile("bin").getChildFile("python");
+        return bundledPython.getChildFile("bin").getChildFile("python");
 #endif
     }
 
     inline void ensureFoldersExist()
     {
         dataPilotDir().createDirectory();
-        singerUserDir().createDirectory();
+        workingDataDir().createDirectory();
         configsDir().createDirectory();
         srcDir().createDirectory();
         mlDir().createDirectory();
-        pythonDir().createDirectory();
+
+        // Only create legacy packaged python dir; never create a fake .venv.
+        if (!root().getChildFile(".venv").isDirectory())
+            root().getChildFile("python").createDirectory();
     }
 
     //==============================================================================

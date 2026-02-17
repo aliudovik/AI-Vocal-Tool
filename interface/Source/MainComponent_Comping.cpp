@@ -24,6 +24,120 @@ void MainComponent::sanitizeCompSegments()
               });
 }
 
+void MainComponent::syncActiveCompResultFromLegacyState()
+{
+    if (activeCompResultIndex < 0 || activeCompResultIndex >= compResults.size())
+        return;
+
+    auto& result = compResults.getReference(activeCompResultIndex);
+    result.compedFile = lastCompedFile;
+    result.compmapFile = lastCompmapFile;
+    result.alphaPct = lastCompAlphaPct;
+    result.crossfadePct = lastCompCrossfadePct;
+    result.fadeFraction = lastCompFadeFraction;
+    result.segments = compSegments;
+    result.boundaries = compBoundaries;
+    result.compmapJson = compmapJsonCache;
+    result.selected = compedSelected;
+    result.solo = compedSolo;
+}
+
+void MainComponent::syncLegacyStateFromActiveCompResult()
+{
+    if (activeCompResultIndex < 0 || activeCompResultIndex >= compResults.size())
+        return;
+
+    const auto& result = compResults.getReference(activeCompResultIndex);
+    lastCompedFile = result.compedFile;
+    lastCompmapFile = result.compmapFile;
+    lastCompAlphaPct = result.alphaPct;
+    lastCompCrossfadePct = result.crossfadePct;
+    lastCompFadeFraction = result.fadeFraction;
+    compSegments = result.segments;
+    compBoundaries = result.boundaries;
+    compmapJsonCache = result.compmapJson;
+    compedSelected = result.selected;
+    compedSolo = result.solo;
+}
+
+bool MainComponent::setActiveCompResult(int index, bool prepareAudition)
+{
+    if (index < 0 || index >= compResults.size())
+        return false;
+
+    if (activeCompResultIndex >= 0
+        && activeCompResultIndex < compResults.size()
+        && activeCompResultIndex != index)
+        syncActiveCompResultFromLegacyState();
+
+    activeCompResultIndex = index;
+    syncLegacyStateFromActiveCompResult();
+
+    hasLastCompResult = (compResults.size() > 0);
+    hasCompedThumbnail = false;
+    compedThumbnail.clear();
+    if (lastCompedFile.existsAsFile())
+    {
+        compedThumbnail.setSource(new juce::FileInputSource(lastCompedFile));
+        hasCompedThumbnail = compedThumbnail.getTotalLength() > 0.0;
+    }
+    else if (lastCompedFile.getFullPathName().isNotEmpty())
+    {
+        DBG("setActiveCompResult: missing comped file: " + lastCompedFile.getFullPathName());
+    }
+    else
+    {
+        DBG("setActiveCompResult: empty comped file path");
+    }
+
+    rebuildCompResultThumbnails();
+
+    if (compSegments.isEmpty() && lastCompmapFile.existsAsFile())
+    {
+        if (!loadLastCompForReview())
+            DBG("setActiveCompResult: loadLastCompForReview() failed for active result");
+    }
+    else if (prepareAudition)
+        prepareCompedAuditionSource();
+
+    refreshCompedButtons();
+    return true;
+}
+
+void MainComponent::rebuildCompResultThumbnails()
+{
+    for (auto& thumb : compResultThumbnails)
+    {
+        if (thumb != nullptr)
+            thumb->removeChangeListener(this);
+        thumb.reset();
+    }
+
+    const int rowsToBuild = juce::jmin(kMaxCompResultRows, compResults.size());
+    for (int i = 0; i < rowsToBuild; ++i)
+    {
+        const auto& rowFile = compResults.getReference(i).compedFile;
+        if (!rowFile.existsAsFile())
+            continue;
+
+        auto rowThumb = std::make_unique<juce::AudioThumbnail>(512, formatManager, thumbnailCache);
+        rowThumb->addChangeListener(this);
+        rowThumb->setSource(new juce::FileInputSource(rowFile));
+        compResultThumbnails[(size_t)i] = std::move(rowThumb);
+    }
+}
+
+juce::String MainComponent::getCompResultTitle(int index) const
+{
+    if (index == 0)
+        return "COMPED TAKE 1";
+    if (index == 1)
+        return "Alternative 1";
+    if (index == 2)
+        return "Alternative 2";
+    return "Comped";
+}
+
 void MainComponent::runCompingFromGui()
 {
     // ---- QUICK VALIDATION ON UI THREAD ----
@@ -72,6 +186,8 @@ void MainComponent::runCompingFromGui()
     const int    crossfadePct = juce::jlimit(0, 100, juce::roundToInt(cfSliderVal));
     const double fadeFraction = juce::jmap(cfSliderVal, 0.0, 100.0, 0.05, 0.30);
     const int    bpmValue = bpm;
+    const juce::String keyModeValue = selectedKeyMode.isNotEmpty() ? selectedKeyMode : "chromatic";
+    const juce::String keyRootValue = selectedKeyRoot.isNotEmpty() ? selectedKeyRoot : "C";
     const bool debugML = false; // ML DEBUG
 
     const juce::String phraseNum = juce::String(currentPhraseIndex).paddedLeft('0', 2);
@@ -81,29 +197,29 @@ void MainComponent::runCompingFromGui()
         << ", crossfadePct=" << crossfadePct
         << ", fadeFraction=" << fadeFraction
         << ", bpm=" << bpmValue
+        << ", keyMode=" << keyModeValue
+        << ", keyRoot=" << keyRootValue
         << ", select=" << select);
 
     const juce::String compedName =
         "comped-" + juce::String(alphaPct) + "-" + juce::String(crossfadePct) + ".wav";
     juce::File compedTargetFile = currentPhraseDirectory.getChildFile(compedName);
+    juce::File compedAlt1File = currentPhraseDirectory.getChildFile(
+        "comped-" + juce::String(alphaPct) + "-" + juce::String(crossfadePct) + "-alt1.wav");
+    juce::File compedAlt2File = currentPhraseDirectory.getChildFile(
+        "comped-" + juce::String(alphaPct) + "-" + juce::String(crossfadePct) + "-alt2.wav");
 
     const juce::String compmapName = "compmap-" + juce::String(alphaPct) + ".json";
     juce::File compmapTargetFile = currentPhraseDirectory.getChildFile(compmapName);
-    
 
-    
-    
-
-    // Remember last result metadata (file paths & settings)
-    lastCompedFile = compedTargetFile;
-    lastCompmapFile = compmapTargetFile;
+    // Cache latest run settings for new comp-result entries.
     lastCompAlphaPct = alphaPct;
     lastCompCrossfadePct = crossfadePct;
     lastCompFadeFraction = fadeFraction;
-    compedSelected = true;
-    compedSolo = false;
-    refreshCompedButtons();
+
     
+    
+
     const bool mlUsed = mlModeToggle.getToggleState();
 
     // Figure out project root and python path
@@ -157,6 +273,12 @@ void MainComponent::runCompingFromGui()
     args.add(juce::String(alphaPct));
     args.add("--bpm");
     args.add(juce::String(bpmValue));
+    args.add("--key_mode");
+    args.add(keyModeValue);
+    args.add("--key_root");
+    args.add(keyRootValue);
+    args.add("--key_tolerance_cents");
+    args.add("65.0");
     args.add("--fade_fraction");
     args.add(juce::String(fadeFraction));
     if (mlUsed)
@@ -178,6 +300,8 @@ void MainComponent::runCompingFromGui()
     auto projectRootCopy = projectRoot;
     auto argsCopy = args;
     auto compedFileCopy = compedTargetFile;
+    auto compedAlt1Copy = compedAlt1File;
+    auto compedAlt2Copy = compedAlt2File;
     auto compmapFileCopy = compmapTargetFile;
     auto ppath = pythonExe.getFullPathName();
     
@@ -204,6 +328,8 @@ void MainComponent::runCompingFromGui()
         projectRootCopy,
         argsCopy,
         compedFileCopy,
+        compedAlt1Copy,
+        compedAlt2Copy,
         compmapFileCopy,
         mlUsed, debugML]() mutable
     {
@@ -218,13 +344,19 @@ void MainComponent::runCompingFromGui()
 
         juce::ChildProcess process;
 
-        // ---- Build the command via helper (proper quoting + UTF-8 + stderr) ----
+        // ---- Build a command string for logs and launch safely per-platform ----
         juce::String cmd = AppPaths::buildPythonCommand(argsCopy);
 
         juce::Logger::writeToLog("run_comping CMD: " + cmd);
         juce::Logger::writeToLog("run_comping CWD: " + projectRootCopy.getFullPathName());
 
-        if (!process.start(cmd))
+#if JUCE_WINDOWS
+        const bool started = process.start(cmd);
+#else
+        const bool started = process.start(argsCopy);
+#endif
+
+        if (!started)
         {
             errorMessage = "Could not launch Python process.\nCommand:\n" + cmd;
             juce::Logger::writeToLog("run_comping: process.start() FAILED");
@@ -307,6 +439,8 @@ void MainComponent::runCompingFromGui()
             compmapMissing,
             errorMessage,
             compedFileCopy,
+            compedAlt1Copy,
+            compedAlt2Copy,
             compmapFileCopy,
             mlUsed,
             mlServerMsg, debugML]() mutable
@@ -337,15 +471,74 @@ void MainComponent::runCompingFromGui()
                     mlServerMsg);
             }
 
-            if (!safeThis->loadCompedFile(compedFileCopy))
+            juce::Array<juce::File> producedCompedFiles;
+            producedCompedFiles.add(compedFileCopy);
+            if (compedAlt1Copy.existsAsFile())
+                producedCompedFiles.add(compedAlt1Copy);
+            if (compedAlt2Copy.existsAsFile())
+                producedCompedFiles.add(compedAlt2Copy);
+
+            if (producedCompedFiles.isEmpty())
             {
                 safeThis->onCompingFinished(false);
                 return;
             }
 
-            safeThis->hasLastCompResult = true;
-            safeThis->lastCompedFile = compedFileCopy;
-            safeThis->lastCompmapFile = compmapFileCopy;
+            safeThis->compResults.clear();
+            for (int i = 0; i < producedCompedFiles.size(); ++i)
+            {
+                MainComponent::CompResult result;
+                result.compedFile = producedCompedFiles.getReference(i);
+                result.compmapFile = compmapFileCopy;
+                result.alphaPct = safeThis->lastCompAlphaPct;
+                result.crossfadePct = safeThis->lastCompCrossfadePct;
+                result.fadeFraction = safeThis->lastCompFadeFraction;
+                result.selected = (i == 0);
+                result.solo = false;
+                safeThis->compResults.add(result);
+            }
+
+            safeThis->hasLastCompResult = (safeThis->compResults.size() > 0);
+            safeThis->activeCompResultIndex = -1; // avoid overwriting fresh row 0 from stale legacy fields
+            if (!safeThis->setActiveCompResult(0, false))
+            {
+                safeThis->onCompingFinished(false);
+                return;
+            }
+
+            // Load segment/boundary data for all alternatives so first paint is complete.
+            for (int i = 1; i < safeThis->compResults.size(); ++i)
+            {
+                if (!safeThis->setActiveCompResult(i, false))
+                    DBG("runCompingFromGui: failed to activate alternative row " + juce::String(i));
+            }
+            if (!safeThis->setActiveCompResult(0, false))
+            {
+                safeThis->onCompingFinished(false);
+                return;
+            }
+            safeThis->rebuildCompResultThumbnails();
+
+            if (!safeThis->lastCompedFile.getFullPathName().isNotEmpty())
+            {
+                const auto producedPrimary = producedCompedFiles.getFirst().getFullPathName();
+                const auto row0Primary =
+                    safeThis->compResults.isEmpty()
+                        ? juce::String("<none>")
+                        : safeThis->compResults.getReference(0).compedFile.getFullPathName();
+                DBG("Comping primary-path debug: producedPrimary=" + producedPrimary
+                    + " row0Primary=" + row0Primary
+                    + " lastCompedFile=" + safeThis->lastCompedFile.getFullPathName());
+                safeThis->onCompingFinished(false);
+                juce::AlertWindow::showMessageBoxAsync(
+                    juce::AlertWindow::WarningIcon,
+                    "Comping error",
+                    "No primary comped path selected after comping.");
+                return;
+            }
+            // Use compmap + CompedAuditionSource from the start so playback sample rate matches device (no Python WAV rate mismatch).
+            if (!safeThis->loadLastCompForReview())
+                safeThis->loadCompedFile(safeThis->lastCompedFile); // fallback if no compmap (waveform-only)
 
             safeThis->compedTabButton.setEnabled(true);
             safeThis->updateTabButtonStyles();
@@ -367,12 +560,14 @@ void MainComponent::runCompingFromGui()
             if (mlUsed)
             {
                 msg = "ML comping successful. Model used: BalancedRandomForest.\n"
-                      "Wrote comped audio file to:\n" + compedFileCopy.getFullPathName();
+                      "Wrote " + juce::String(producedCompedFiles.size())
+                      + " comped audio file(s), primary at:\n" + compedFileCopy.getFullPathName();
             }
             else
             {
                 msg = "Comping successful.\n"
-                      "Wrote comped audio file to:\n" + compedFileCopy.getFullPathName();
+                      "Wrote " + juce::String(producedCompedFiles.size())
+                      + " comped audio file(s), primary at:\n" + compedFileCopy.getFullPathName();
             }
 
             juce::AlertWindow::showMessageBoxAsync(
@@ -383,8 +578,15 @@ void MainComponent::runCompingFromGui()
                 safeThis,
                 juce::ModalCallbackFunction::create([safeThis](int)
                 {
-                    if (!safeThis->loadLastCompForReview())
+                    if (safeThis->compSegments.isEmpty() && !safeThis->loadLastCompForReview())
                         DBG("CompReview: loadLastCompForReview() failed");
+
+                    if (!safeThis->segmentTimingTipShownOnce)
+                    {
+                        safeThis->segmentTimingTipShownOnce = true;
+                        safeThis->segmentTimingTipShowUntilMs =
+                            juce::Time::getMillisecondCounterHiRes() + 6500.0;
+                    }
 
                     safeThis->viewMode = ViewMode::CompReview;
                     safeThis->updateTabButtonStyles();
@@ -401,6 +603,15 @@ void MainComponent::runCompingFromGui()
 
 bool MainComponent::loadCompedFile(const juce::File& file)
 {
+    if (!file.getFullPathName().isNotEmpty())
+    {
+        juce::AlertWindow::showMessageBoxAsync(
+            juce::AlertWindow::WarningIcon,
+            "Comping error",
+            "No primary comped path selected.");
+        return false;
+    }
+
     if (!file.existsAsFile())
     {
         juce::AlertWindow::showMessageBoxAsync(
@@ -422,6 +633,7 @@ bool MainComponent::loadCompedFile(const juce::File& file)
         return false;
     }
 
+    const double fileSampleRate = reader->sampleRate;
     auto newSource =
         std::make_unique<juce::AudioFormatReaderSource>(reader.release(), true);
 
@@ -436,7 +648,7 @@ bool MainComponent::loadCompedFile(const juce::File& file)
         newSource.get(),
         0,
         nullptr,
-        currentSampleRate);
+        fileSampleRate > 0.0 ? fileSampleRate : currentSampleRate);
 
     takeTransport.setLooping(true);
 
@@ -451,23 +663,59 @@ bool MainComponent::loadLastCompForReview()
 {
     DBG("loadLastCompForReview() called");
 
+    if (compResults.isEmpty() && hasLastCompResult)
+    {
+        CompResult legacy;
+        legacy.compedFile = lastCompedFile;
+        legacy.compmapFile = lastCompmapFile;
+        legacy.alphaPct = lastCompAlphaPct;
+        legacy.crossfadePct = lastCompCrossfadePct;
+        legacy.fadeFraction = lastCompFadeFraction;
+        legacy.selected = compedSelected;
+        legacy.solo = compedSolo;
+        legacy.segments = compSegments;
+        legacy.boundaries = compBoundaries;
+        legacy.compmapJson = compmapJsonCache;
+        compResults.add(legacy);
+        activeCompResultIndex = 0;
+    }
+
+    if (!compResults.isEmpty())
+    {
+        if (activeCompResultIndex < 0 || activeCompResultIndex >= compResults.size())
+            activeCompResultIndex = 0;
+        syncLegacyStateFromActiveCompResult();
+    }
+
     compSegments.clear();
     compBoundaries.clear();
     compmapJsonCache = juce::var();
     hasCompedThumbnail = false;
     compedThumbnail.clear();
 
-    if (!hasLastCompResult)
+    if (!hasLastCompResult && compResults.isEmpty())
         return false;
 
-    if (!lastCompedFile.existsAsFile())
+    if (!lastCompedFile.getFullPathName().isNotEmpty())
+    {
+        DBG("loadLastCompForReview: empty comped path");
         return false;
+    }
+
+    if (!lastCompedFile.existsAsFile())
+    {
+        DBG("loadLastCompForReview: comped file missing " + lastCompedFile.getFullPathName());
+        return false;
+    }
 
     compedThumbnail.setSource(new juce::FileInputSource(lastCompedFile));
     hasCompedThumbnail = (compedThumbnail.getTotalLength() > 0.0);
 
     if (!lastCompmapFile.existsAsFile())
+    {
+        DBG("loadLastCompForReview: no compmap file, using waveform only");
         return hasCompedThumbnail;
+    }
 
     juce::FileInputStream in(lastCompmapFile);
     if (!in.openedOk())
@@ -507,6 +755,8 @@ bool MainComponent::loadLastCompForReview()
     if (segmentsArray == nullptr)
         return hasCompedThumbnail;
 
+    const int alternativeRank = juce::jlimit(0, 2, activeCompResultIndex);
+
     for (const auto& segVar : *segmentsArray)
     {
         if (!segVar.isObject())
@@ -522,35 +772,54 @@ bool MainComponent::loadLastCompForReview()
         if (!(endSec > startSec))
             continue;
 
-        int takeIndex = -1;
-
+        juce::StringArray rankedTakes;
         auto winnerVar = segObj->getProperty("winner");
         if (winnerVar.isObject())
-        {
             if (auto* winnerObj = winnerVar.getDynamicObject())
+                rankedTakes.addIfNotAlreadyThere(winnerObj->getProperty("take").toString());
+
+        auto candidatesVar = segObj->getProperty("candidates");
+        if (candidatesVar.isArray())
+        {
+            if (auto* candidatesArr = candidatesVar.getArray())
             {
-                auto takeNameVar = winnerObj->getProperty("take");
-                if (takeNameVar.isString())
+                for (const auto& candVar : *candidatesArr)
                 {
-                    juce::String takeName = takeNameVar.toString();
-                    if (takeName.startsWithIgnoreCase("take_"))
-                    {
-                        juce::String numStr = takeName.fromFirstOccurrenceOf("take_", false, false);
-                        takeIndex = numStr.getIntValue();
-                    }
-                    else
-                    {
-                        takeIndex = takeName.getIntValue();
-                    }
-                    if (takeIndex <= 0)
-                        takeIndex = -1;
+                    if (!candVar.isObject())
+                        continue;
+                    if (auto* candObj = candVar.getDynamicObject())
+                        rankedTakes.addIfNotAlreadyThere(candObj->getProperty("take").toString());
                 }
             }
+        }
+
+        int takeIndex = -1;
+        if (!rankedTakes.isEmpty())
+        {
+            const int takeChoiceIdx = juce::jmin(alternativeRank, rankedTakes.size() - 1);
+            juce::String takeName = rankedTakes[takeChoiceIdx];
+            if (takeName.startsWithIgnoreCase("take_"))
+            {
+                juce::String numStr = takeName.fromFirstOccurrenceOf("take_", false, false);
+                takeIndex = numStr.getIntValue();
+            }
+            else
+            {
+                takeIndex = takeName.getIntValue();
+            }
+            if (takeIndex <= 0)
+                takeIndex = -1;
         }
 
         CompSegment seg;
         seg.startSec = startSec;
         seg.endSec = endSec;
+        if (segObj->hasProperty("source_offset_s"))
+            seg.sourceOffsetSec = (double)segObj->getProperty("source_offset_s");
+        else if (segObj->hasProperty("sourceOffsetSec"))
+            seg.sourceOffsetSec = (double)segObj->getProperty("sourceOffsetSec");
+        else
+            seg.sourceOffsetSec = 0.0;
         seg.takeIndex = takeIndex;
         compSegments.add(seg);
         
@@ -680,6 +949,7 @@ bool MainComponent::loadLastCompForReview()
         << " segments, boundaries=" << compBoundaries.size());
 
     prepareCompedAuditionSource();
+    syncActiveCompResultFromLegacyState();
 
     return hasCompedThumbnail || !compSegments.isEmpty();
 
@@ -690,6 +960,11 @@ bool MainComponent::loadLastCompForReview()
 bool MainComponent::prepareCompedAuditionSource()
 {
     hasCompedAuditionSource = false;
+
+    // Critical order: detach transport before destroying source.
+    takeTransport.stop();
+    takeTransport.setSource(nullptr);
+    takeReaderSource.reset();
     compedAuditionSource.reset();
 
     if (compSegments.isEmpty())
@@ -723,6 +998,7 @@ bool MainComponent::prepareCompedAuditionSource()
         CompedAuditionSource::SegmentInfo si;
         si.startSec = s.startSec;
         si.endSec = s.endSec;
+        si.sourceOffsetSec = s.sourceOffsetSec;
         si.takeIndex = s.takeIndex;
         segs.push_back(si);
     }
@@ -742,16 +1018,13 @@ bool MainComponent::prepareCompedAuditionSource()
     src->setXFadeCurve(CompedAuditionSource::XFadeCurve::Linear);
 
     // Attach to takeTransport (replaces the rendered comped WAV for audition)
-    takeTransport.stop();
-    takeTransport.setSource(nullptr);
-    takeReaderSource.reset();        // NOTE: UI checks still reference this (we?ll fix in Step C)
     selectedTakeIndex = -1;
     soloTakeIndex = -1;
 
-    takeTransport.setSource(src.get(), 0, nullptr, currentSampleRate);
+    compedAuditionSource = std::move(src);
+    takeTransport.setSource(compedAuditionSource.get(), 0, nullptr, currentSampleRate);
     takeTransport.setLooping(true);
 
-    compedAuditionSource = std::move(src);
     hasCompedAuditionSource = true;
     return true;
 }
@@ -814,6 +1087,7 @@ void MainComponent::updateCompedAuditionSourceFromEdits()
         CompedAuditionSource::SegmentInfo si;
         si.startSec = s.startSec;
         si.endSec = s.endSec;
+        si.sourceOffsetSec = s.sourceOffsetSec;
         si.takeIndex = s.takeIndex;
         segs.push_back(si);
     }
@@ -831,6 +1105,7 @@ void MainComponent::updateCompedAuditionSourceFromEdits()
 
     compedAuditionSource->setCompData(segs, bounds);
     compedAuditionSource->setXFadeCurve(CompedAuditionSource::XFadeCurve::Linear);
+    syncActiveCompResultFromLegacyState();
 }
 
 //==============================================================================
@@ -877,6 +1152,7 @@ bool MainComponent::buildCompedAuditionSourceForExport(std::unique_ptr<CompedAud
         CompedAuditionSource::SegmentInfo si;
         si.startSec = s.startSec;
         si.endSec = s.endSec;
+        si.sourceOffsetSec = s.sourceOffsetSec;
         si.takeIndex = s.takeIndex;
         segs.push_back(si);
     }
@@ -997,7 +1273,10 @@ void MainComponent::exportCompedAuditionToFileAsync(const juce::File& targetFile
         juce::int64 written = 0;
         while (written < totalSamples)
         {
-            const int numThis = (int) juce::jmin<juce::int64>(blockSize, totalSamples - written);
+            const juce::int64 remaining = totalSamples - written;
+            const int numThis = (int) ((remaining < (juce::int64) blockSize)
+                ? remaining
+                : (juce::int64) blockSize);
             buffer.clear();
             info.numSamples = numThis;
 
@@ -1081,10 +1360,11 @@ void MainComponent::rebuildCompedFromEditedCompmapAsync()
     juce::Logger::writeToLog("rebuildComped CMD: " + cmdLine);
 
     auto projectRootCopy = projectRoot;
+    auto argsCopy = args;
     auto cmdLineCopy = cmdLine;
     auto compedCopy = lastCompedFile;
 
-    std::thread([safeThis, projectRootCopy, cmdLineCopy, compedCopy]() mutable
+    std::thread([safeThis, projectRootCopy, argsCopy, cmdLineCopy, compedCopy]() mutable
         {
             bool success = false;
             juce::String errorMessage;
@@ -1093,7 +1373,12 @@ void MainComponent::rebuildCompedFromEditedCompmapAsync()
             projectRootCopy.setAsCurrentWorkingDirectory();
 
             juce::ChildProcess process;
-            if (!process.start(cmdLineCopy))
+#if JUCE_WINDOWS
+            const bool started = process.start(cmdLineCopy);
+#else
+            const bool started = process.start(argsCopy);
+#endif
+            if (!started)
             {
                 errorMessage = "Could not launch Python stitch_only process.\nCommand:\n" + cmdLineCopy;
                 juce::Logger::writeToLog("stitch_only: process.start() FAILED");

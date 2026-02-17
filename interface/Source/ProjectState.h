@@ -7,6 +7,7 @@ struct CompSegmentState
 {
     double startSec = 0.0;
     double endSec = 0.0;
+    double sourceOffsetSec = 0.0;
     int    takeIndex = -1; // 1-based (same as JSON "take_3" -> 3)
 
     juce::var toVar() const;
@@ -23,10 +24,27 @@ struct CompBoundaryState
     static CompBoundaryState fromVar(const juce::var& v);
 };
 
+struct CompResultState
+{
+    bool         hasResult = false;
+    juce::String compedFilePath;
+    juce::String compmapFilePath;
+    int          alphaPct = 0;
+    int          crossfadePct = 0;
+    double       fadeFraction = 0.0;
+    bool         selected = true;
+    bool         solo = false;
+    juce::Array<CompSegmentState> segments;
+    juce::Array<CompBoundaryState> boundaries;
+
+    juce::var toVar() const;
+    static CompResultState fromVar(const juce::var& v);
+};
+
 // Full project state that can be saved/loaded as JSON
 struct ProjectState
 {
-    int version = 1;
+    int version = 2;
 
     // Instrumental & loop
     juce::String instrumentalPath;
@@ -39,6 +57,8 @@ struct ProjectState
     int  bpm = 120;
     bool bpmSet = false;
     bool metronomeOn = false;
+    juce::String selectedKeyMode = "chromatic";
+    juce::String selectedKeyRoot = "C";
 
     // Phrase folder
     int         currentPhraseIndex = 1;
@@ -72,6 +92,10 @@ struct ProjectState
 
     // Optional cached segments (in addition to compmap JSON)
     juce::Array<CompSegmentState> compSegments;
+
+    // v2: multi-comp results
+    juce::Array<CompResultState> compResults;
+    int activeCompResultIndex = 0;
 
     // Serialisation helpers
     juce::var      toVar() const;

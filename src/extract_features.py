@@ -31,7 +31,7 @@ from src.io import load_wav
 from src.segmentation import one_phrase, segment_phrase_reference
 from src.features import (
     f0_crepe_16k,
-    pitch_rmse_vs_median,
+    in_key_voiced_ratio,
     snr_simple,
     deesser_ratio,
     clip_count,
@@ -61,7 +61,7 @@ def _get_smile():
     if _SMILE_EXTRACTOR is None:
         import opensmile
         _SMILE_EXTRACTOR = opensmile.Smile(
-            feature_set=opensmile.FeatureSet.ComParE_2016,
+            feature_set=opensmile.FeatureSet.eGeMAPSv02,
             feature_level=opensmile.FeatureLevel.Functionals,
         )
     return _SMILE_EXTRACTOR
@@ -105,8 +105,8 @@ def parse_selection(sel):
 
 def prompt_if_missing(args):
     """
-    If --select, --alpha_pct, or --bpm are not provided, prompt in the console.
-    Returns (select_str, alpha_pct_int, bpm_float).
+    If key args are not provided, fallback to chromatic/C defaults.
+    Returns (select_str, alpha_pct_int, bpm_float, key_mode_str, key_root_str).
     """
     # Phrase selection
     sel = args.select
@@ -148,7 +148,15 @@ def prompt_if_missing(args):
                 pass
             print("Please enter a positive number for BPM (e.g., 90).")
 
-    return sel, alpha_pct, bpm
+    key_mode = (args.key_mode or "chromatic").strip().lower()
+    if key_mode not in ("major", "minor", "chromatic"):
+        key_mode = "chromatic"
+
+    key_root = (args.key_root or "C").strip()
+    if not key_root:
+        key_root = "C"
+
+    return sel, alpha_pct, bpm, key_mode, key_root
 
 
 def _load_cfg(cfg_path_str):
@@ -185,6 +193,9 @@ def run_feature_extraction(
     explicit_compmap_path=None,
     fade_fraction=0.15,
     use_ml=False,
+    key_mode="chromatic",
+    key_root="C",
+    key_tolerance_cents=65.0,
 ):
 
 
@@ -203,6 +214,12 @@ def run_feature_extraction(
             Accuracy weight in percent; Emotion gets the remainder.
         bpm (float):
             Tempo in BPM.
+        key_mode (str):
+            Key mode: major/minor/chromatic.
+        key_root (str):
+            Root note name (e.g. C, C#, Db).
+        key_tolerance_cents (float):
+            Tolerance for in-key decision per voiced frame.
         cfg_path (str or Path):
             YAML configuration path.
         out_dir (str or Path):
@@ -226,6 +243,9 @@ def run_feature_extraction(
     sr_proc = int(cfg.get("sample_rate", 48000))
     sr_f0 = int(cfg.get("f0_sr", 16000))
     alpha = float(alpha_pct) / 100.0
+    key_mode = str(key_mode or "chromatic").strip().lower()
+    key_root = str(key_root or "C").strip()
+    key_tolerance_cents = float(key_tolerance_cents)
 
     # Optional custom weights from YAML
     weights_cfg = cfg.get("weights", {}) or {}
@@ -296,7 +316,14 @@ def run_feature_extraction(
             "take": take_id,
             "start_s": s0,
             "end_s": e0,
-            "f0_rmse_c": pitch_rmse_vs_median(f0, periodicity),
+            "in_key_ratio": in_key_voiced_ratio(
+                f0,
+                periodicity,
+                pd_thresh=0.6,
+                key_mode=key_mode,
+                key_root=key_root,
+                tolerance_cents=key_tolerance_cents,
+            ),
             "voiced_ratio": voiced_ratio(periodicity),
             "mean_periodicity": mean_periodicity(periodicity),
             "snr_db": snr_simple(yph),
@@ -444,7 +471,14 @@ def run_feature_extraction(
                 "segment_idx": seg_idx,
                 "seg_start_s": s_clamp,
                 "seg_end_s": e_clamp,
-                "f0_rmse_c": pitch_rmse_vs_median(f0_seg, pd_seg),
+                "in_key_ratio": in_key_voiced_ratio(
+                    f0_seg,
+                    pd_seg,
+                    pd_thresh=0.6,
+                    key_mode=key_mode,
+                    key_root=key_root,
+                    tolerance_cents=key_tolerance_cents,
+                ),
                 "voiced_ratio": voiced_ratio(pd_seg),
                 "mean_periodicity": mean_periodicity(pd_seg),
                 "snr_db": snr_simple(y_seg),
@@ -526,7 +560,7 @@ def run_feature_extraction(
             "acc_score": float(best["acc_score"]),
             "emo_score": float(best["emo_score"]),
             "snr_db": float(best["snr_db"]),
-            "f0_rmse_c": float(best["f0_rmse_c"]),
+            "in_key_ratio": float(best["in_key_ratio"]),
         }
 
         # Alternative candidates close in quality
@@ -542,7 +576,7 @@ def run_feature_extraction(
                         "acc_score": float(row["acc_score"]),
                         "emo_score": float(row["emo_score"]),
                         "snr_db": float(row["snr_db"]),
-                        "f0_rmse_c": float(row["f0_rmse_c"]),
+                        "in_key_ratio": float(row["in_key_ratio"]),
                     }
                 )
 
@@ -565,6 +599,9 @@ def run_feature_extraction(
         "alpha": alpha,
         "alpha_pct": int(round(alpha * 100)),
         "bpm": float(bpm),
+        "key_mode": key_mode,
+        "key_root": key_root,
+        "key_tolerance_cents": key_tolerance_cents,
         "base_dir": base_str,
         "relative_path": rel,
         "reference_take": ref_id,
@@ -631,6 +668,22 @@ def main():
         help="YAML with sample_rate, f0_sr, weights, etc.",
     )
     ap.add_argument(
+        "--key_mode",
+        default="chromatic",
+        help="Key mode: major, minor, or chromatic (default: chromatic).",
+    )
+    ap.add_argument(
+        "--key_root",
+        default="C",
+        help="Key root note (e.g. C, C#, Db).",
+    )
+    ap.add_argument(
+        "--key_tolerance_cents",
+        type=float,
+        default=65.0,
+        help="Tolerance in cents for in-key decision per voiced frame (default: 65).",
+    )
+    ap.add_argument(
         "--out_dir",
         default="outputs",
         help="Folder to write CSV/JSON outputs into",
@@ -643,7 +696,7 @@ def main():
     args = ap.parse_args()
 
     # Interactive fallback (same behaviour as before)
-    select_str, alpha_pct, bpm = prompt_if_missing(args)
+    select_str, alpha_pct, bpm, key_mode, key_root = prompt_if_missing(args)
 
     # Delegate to the programmatic helper
     run_feature_extraction(
@@ -654,6 +707,9 @@ def main():
         cfg_path=args.cfg,
         out_dir=args.out_dir,
         debug_emotion=args.debug_emotion,
+        key_mode=key_mode,
+        key_root=key_root,
+        key_tolerance_cents=args.key_tolerance_cents,
     )
 
 

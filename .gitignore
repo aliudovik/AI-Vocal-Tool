@@ -1,6 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-*.py[codz]
+*.py[cod]
 *$py.class
 
 # C extensions
@@ -137,7 +137,7 @@ celerybeat.pid
 # Environments
 .env
 .envrc
-.venv
+/.venv/
 env/
 venv/
 ENV/
@@ -237,6 +237,17 @@ node_modules/
 npm-debug.log*
 .yarn/*
 .pnpm-store/
+
+# --- Build / dist (platform-specific, keep CMakeLists / cmake source) ---
+build-linux/
+dist-linux-rhel/
+*.zip
+
+# --- macOS ---
+.DS_Store
+
+# --- Logs / temp ---
+debug_log.txt
 
 # --- C++/JUCE ---
 *.user

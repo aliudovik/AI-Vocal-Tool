@@ -23,13 +23,18 @@ def norm_block(row):
     """
     Normalize accuracy to 0..1 scales.
     Inputs expected in 'row':
-      - f0_rmse_c (cents, lower better)
+      - in_key_ratio (0..1, higher better) OR f0_rmse_c fallback
       - snr_db (dB, higher better)
       - deess_ratio (hi/mid ratio, moderate best -> handled in extractor or switch to triangle later)
       - clip_n (int, 0 best)
     """
-    # pitch: widen mapping range so differences show up; reward lower RMSE
-    pitch = 1.0 - linmap(float(_safe(row.get('f0_rmse_c'), 300.0)), 0.0, 300.0)
+    # Prefer key-aware pitch metric. Keep RMSE fallback for older rows.
+    in_key = row.get("in_key_ratio", None)
+    if in_key is not None:
+        pitch = float(np.clip(float(_safe(in_key, 0.0)), 0.0, 1.0))
+    else:
+        # Legacy fallback: lower RMSE is better.
+        pitch = 1.0 - linmap(float(_safe(row.get("f0_rmse_c"), 300.0)), 0.0, 300.0)
 
     # SNR: cap so extremely clean doesn't dominate
     snr_val = min(float(_safe(row.get('snr_db'), 0.0)), 40.0)

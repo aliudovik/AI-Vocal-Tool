@@ -13,7 +13,7 @@ One-button vocal comping app that helps singers record multiple takes on a loop 
 Traditional comping in a DAW is powerful but slow: record takes, manually slice phrases, audition, crossfade, and assemble. **AI Vocal Comp** compresses that workflow into a fast loop:
 
 1. **Import** an instrumental
-2. Set **BPM**
+2. Set **BPM + Key** (Major/Minor/Chromatic)
 3. Define **IN/OUT** loop
 4. Press **Record** (once) to capture multiple takes
 5. App **auto-pads + splits** the recording into loop-sized takes
@@ -34,6 +34,7 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 - **One-button loop recording:** record continuously inside IN/OUT and stop anytime.
 - **Auto-padding + deterministic take splitting:** on stop, audio is padded to the loop length and split into take-sized regions.
 - **Musical segmentation (Python):** BPM-aware segmentation that prefers low-energy RMS valleys to avoid cutting sustained vowels.
+- **Key-aware pitch scoring:** select song key (Major/Minor with root, or Chromatic fallback) and score pitch accuracy by in-key voiced frames instead of blind pitch-only distance.
 - **Manual segmentation point adjustment:** drag green boundary markers on the comping tab to refine phrase boundaries.
 - **Per-segment audition + selection.**
 - **Manual crossfades on the comping tab** (linear crossfade, alpha implementation).
@@ -52,7 +53,7 @@ Traditional comping in a DAW is powerful but slow: record takes, manually slice 
 - **Python toolkit**
   - Feature extraction
   - Segmentation (RMS valleys + BPM-aware target)
-  - Segment scoring / ranking; writing to a compmap json
+  - Segment scoring / ranking with key-aware pitch accuracy; writing to a compmap json
   - Stitching from the compmap
 
 - **Python ML-server**
@@ -169,6 +170,19 @@ This bias intentionally preserves musical phrasing.
 
 ---
 
+### 3) Key-aware pitch accuracy (Python + C++ UI)
+
+Comping now supports **key selection** in the app UI and uses that key in scoring:
+
+- User selects **Mode**: `Major`, `Minor`, or `Chromatic`.
+- User selects **Root** for major/minor (enharmonic labels like `C#/Db` are supported).
+- Pitch accuracy is computed as **in-key voiced-frame ratio** with a configurable cents tolerance (current default: `65` cents).
+- Selected key metadata is written into the compmap JSON (`key_mode`, `key_root`, `key_tolerance_cents`) for traceability.
+
+This allows phrase/take ranking to reflect whether notes fit the selected song key.
+
+---
+
 ## Dataset / data collection
 
 I initially had no “take” dataset for segmentation + ranking experiments, so I built a separate data-collection mini-app to generate consistent takes and labels:
@@ -186,7 +200,6 @@ PC Specs upon testing: Core i7-12700k; 16GB DDR5 4800mhz; PCIe 4.0 NVMe SSD.
 
 ## Roadmap
 
-- Key-based support for improved phrase alignment and song structure awareness.
 - Improved manual crossfades:
   - adjustable crossfade curvature (non-linear shapes),
   - ability to move entire segments, not only boundary connection points.

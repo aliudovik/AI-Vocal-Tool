@@ -14,6 +14,7 @@ public:
     {
         double startSec = 0.0;
         double endSec = 0.0;
+        double sourceOffsetSec = 0.0; // sourceTime = timelineTime + offset
         int    takeIndex = -1;   // e.g. 3 for take_3.wav
     };
 
@@ -73,6 +74,7 @@ private:
     {
         double startSec = 0.0;
         double endSec = 0.0;
+        double sourceOffsetSec = 0.0;
         int    takeSlot = -1;    // index into takes[]
     };
 
@@ -132,5 +134,6 @@ private:
         double outRate);
 
     int findSegmentIndexForTime(double tSec) const noexcept;
+    double mapTimelineToSourceTimeSec(const SegmentState& seg, double timelineSec) const noexcept;
     inline float readSampleFromTakeSlot(int takeSlot, juce::int64 sampleIndex) const noexcept;
 };

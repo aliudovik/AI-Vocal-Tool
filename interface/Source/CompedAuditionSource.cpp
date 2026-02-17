@@ -165,6 +165,7 @@ void CompedAuditionSource::setCompData(const std::vector<SegmentInfo>& newSegmen
         SegmentState ss;
         ss.startSec = s.startSec;
         ss.endSec = s.endSec;
+        ss.sourceOffsetSec = s.sourceOffsetSec;
 
         auto it = takeIndexToSlot.find(s.takeIndex);
         ss.takeSlot = (it != takeIndexToSlot.end()) ? it->second : -1;
@@ -273,6 +274,11 @@ int CompedAuditionSource::findSegmentIndexForTime(double tSec) const noexcept
     return juce::jlimit(0, (int)segments.size() - 1, lo);
 }
 
+double CompedAuditionSource::mapTimelineToSourceTimeSec(const SegmentState& seg, double timelineSec) const noexcept
+{
+    return timelineSec + seg.sourceOffsetSec;
+}
+
 inline float CompedAuditionSource::readSampleFromTakeSlot(int takeSlot, juce::int64 sampleIndex) const noexcept
 {
     if (takeSlot < 0 || takeSlot >= (int)takes.size())
@@ -343,8 +349,11 @@ void CompedAuditionSource::getNextAudioBlock(const juce::AudioSourceChannelInfo&
 
         const int segIdx = cachedSegIndex;
 
-        // Default: winner for current segment
-        float sampleOut = readSampleFromTakeSlot(segments[(size_t)segIdx].takeSlot, sPos);
+        // Default: winner for current segment, with optional slip offset.
+        const auto& currentSeg = segments[(size_t)segIdx];
+        const double sourceSec = mapTimelineToSourceTimeSec(currentSeg, tSec);
+        const juce::int64 sourceSample = (juce::int64)std::llround(sourceSec * sourceSampleRateHz);
+        float sampleOut = readSampleFromTakeSlot(currentSeg.takeSlot, sourceSample);
 
         // Boundary mixing check (only adjacent boundaries can cover current segment)
         auto doMix = [&](int bIndex) -> bool
@@ -366,8 +375,16 @@ void CompedAuditionSource::getNextAudioBlock(const juce::AudioSourceChannelInfo&
                 if (rightSeg >= (int)segments.size())
                     return false;
 
-                const float a = readSampleFromTakeSlot(segments[(size_t)leftSeg].takeSlot, sPos);
-                const float b = readSampleFromTakeSlot(segments[(size_t)rightSeg].takeSlot, sPos);
+                const auto& leftState = segments[(size_t)leftSeg];
+                const auto& rightState = segments[(size_t)rightSeg];
+
+                const double leftSourceSec = mapTimelineToSourceTimeSec(leftState, tSec);
+                const double rightSourceSec = mapTimelineToSourceTimeSec(rightState, tSec);
+                const juce::int64 leftSourceSample = (juce::int64)std::llround(leftSourceSec * sourceSampleRateHz);
+                const juce::int64 rightSourceSample = (juce::int64)std::llround(rightSourceSec * sourceSampleRateHz);
+
+                const float a = readSampleFromTakeSlot(leftState.takeSlot, leftSourceSample);
+                const float b = readSampleFromTakeSlot(rightState.takeSlot, rightSourceSample);
 
                 const double u = juce::jlimit(0.0, 1.0, (tSec - xs) / (xe - xs));
 

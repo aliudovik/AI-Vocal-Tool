@@ -37,9 +37,6 @@ soundfile==0.13.1
 soxr==1.0.0
 sympy==1.14.0
 threadpoolctl==3.6.0
-torch==2.9.0
-torchaudio==2.9.0
-torchcrepe==0.0.24
 tqdm==4.67.1
 typing_extensions==4.15.0
 tzdata==2025.2

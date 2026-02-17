@@ -16,12 +16,13 @@ try:
 except ImportError:
     HAS_XGB = False
 
-DATA_ROOT = "data"
-MODEL_DIR = "models"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = os.path.join(SCRIPT_DIR, "data")
+MODEL_DIR = os.path.join(SCRIPT_DIR, "models")
 RESULTS_CSV = os.path.join(MODEL_DIR, "model_results.csv")
 
 smile = opensmile.Smile(
-    feature_set=opensmile.FeatureSet.ComParE_2016,
+    feature_set=opensmile.FeatureSet.eGeMAPSv02,
     feature_level=opensmile.FeatureLevel.Functionals,
 )
 
@@ -142,6 +143,9 @@ def main():
     # Save best model separately
     best_path = os.path.join(MODEL_DIR, "emotion_best.pkl")
     joblib.dump(best_model, best_path)
+    # Compatibility path used by ml/server.py in packaged builds.
+    server_compat_path = os.path.join(MODEL_DIR, "ExtraTrees-best.pkl")
+    joblib.dump(best_model, server_compat_path)
 
     # Save CSV log
     df = pd.DataFrame(results)
@@ -149,6 +153,7 @@ def main():
 
     print(f"\n✅ Best model: {best_name} (AUC={best_auc:.3f})")
     print(f"Saved BEST -> {best_path}")
+    print(f"Saved server-compatible model -> {server_compat_path}")
     print(f"Saved results log -> {RESULTS_CSV}")
 
 if __name__ == "__main__":

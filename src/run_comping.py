@@ -6,6 +6,7 @@
 #
 # Programmatic entry:
 #   run_comping(base_dir, select, alpha_pct, bpm, fade_fraction,
+#               key_mode="chromatic", key_root="C", key_tolerance_cents=65.0,
 #               out_dir="outputs", cfg="configs/weights.yaml")
 #
 # CLI usage example:
@@ -15,6 +16,8 @@
 #       --alpha_pct 60 \
 #       --bpm 90 \
 #       --fade_fraction 0.15 \
+#       --key_mode major \
+#       --key_root C#/Db \
 #       --out_dir outputs
 
 import argparse
@@ -73,6 +76,9 @@ def run_comping(
     out_comped_path=None,
     out_compmap_path=None,
     use_ml=False,
+    key_mode="chromatic",
+    key_root="C",
+    key_tolerance_cents=65.0,
 ):
     """
     Run the full comping pipeline:
@@ -84,7 +90,10 @@ def run_comping(
     cfg_path = str(cfg)
 
     _plog("=== COMPING START ===")
-    _plog(f"base={base_str} select={select} bpm={bpm} alpha={alpha_pct}")
+    _plog(
+        f"base={base_str} select={select} bpm={bpm} alpha={alpha_pct} "
+        f"key_mode={key_mode} key_root={key_root} key_tol={key_tolerance_cents}"
+    )
 
     # ------------------------------------------------------------------
     # 1) Feature extraction + compmap generation (no interactive prompts)
@@ -103,6 +112,9 @@ def run_comping(
         explicit_compmap_path=out_compmap_path,
         fade_fraction=float(fade_fraction),
         use_ml=use_ml,
+        key_mode=key_mode,
+        key_root=key_root,
+        key_tolerance_cents=float(key_tolerance_cents),
     )
     t1 = time.time()
 
@@ -147,21 +159,21 @@ def run_comping(
     _plog("stitch_from_compmap: START")
     t2 = time.time()
 
-    stitch_from_compmap(
+    stitched_paths = stitch_from_compmap(
         compmap_path=compmap_path,
         out_path=out_wav,
         fade_fraction=float(fade_fraction),
         base_override=base_str,
         verbose=True,
+        num_alternatives=3,
     )
 
     t3 = time.time()
-    _plog(
-        f"stitch_from_compmap: END elapsed={t3 - t2:.3f}s out={out_wav}"
-    )
+    stitched_str = ", ".join(str(p) for p in stitched_paths)
+    _plog(f"stitch_from_compmap: END elapsed={t3 - t2:.3f}s out=[{stitched_str}]")
     _plog("=== COMPING END ===")
 
-    return out_wav
+    return Path(stitched_paths[0]) if stitched_paths else out_wav
 
 
 # ----------------------------------------------------------------------
@@ -209,6 +221,22 @@ def _parse_args():
         ),
     )
     p.add_argument(
+        "--key_mode",
+        default="chromatic",
+        help="Key mode: major, minor, or chromatic (default: chromatic).",
+    )
+    p.add_argument(
+        "--key_root",
+        default="C",
+        help="Key root note (e.g. C, C#, Db).",
+    )
+    p.add_argument(
+        "--key_tolerance_cents",
+        type=float,
+        default=65.0,
+        help="Tolerance in cents for in-key frame decision (default: 65).",
+    )
+    p.add_argument(
         "--out_dir",
         default="outputs",
         help="Root output folder (default: outputs).",
@@ -248,6 +276,9 @@ if __name__ == "__main__":
         cfg=args.cfg,
         out_comped_path=args.out_comped_path,
         out_compmap_path=args.out_compmap_path,
-        use_ml=args.use_ml
+        use_ml=args.use_ml,
+        key_mode=args.key_mode,
+        key_root=args.key_root,
+        key_tolerance_cents=args.key_tolerance_cents,
     )
     print(f"\n[RUN COMPING] Wrote final comped file to: {out_path}\n")

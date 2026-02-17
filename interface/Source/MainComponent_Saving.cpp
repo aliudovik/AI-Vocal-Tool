@@ -1,5 +1,98 @@
 // MainComponent_ProjectState.cpp
 #include "MainComponent.h"
+#include "AppPaths.h"
+
+namespace
+{
+    juce::File getPhraseDirectoryFallback(int phraseIndexHint)
+    {
+        auto singerDir = AppPaths::singerUserDir();
+        singerDir.createDirectory();
+
+        const int safeIndex = juce::jmax(1, phraseIndexHint);
+        const juce::String phraseName = "phrase" + juce::String(safeIndex).paddedLeft('0', 2);
+        auto phraseDir = singerDir.getChildFile(phraseName);
+
+        if (!phraseDir.exists())
+            phraseDir.createDirectory();
+
+        if (phraseDir.isDirectory())
+            return phraseDir;
+
+        return singerDir;
+    }
+
+    juce::File getValidPhraseDirectory(const juce::File& candidate, int phraseIndexHint)
+    {
+        if (candidate.isDirectory())
+            return candidate;
+
+        return getPhraseDirectoryFallback(phraseIndexHint);
+    }
+
+    juce::StringArray getKeyModes()
+    {
+        return { "Major", "Minor", "Chromatic" };
+    }
+
+    juce::StringArray getKeyRootsEnharmonic()
+    {
+        return { "C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B" };
+    }
+
+    juce::String normaliseKeyMode(const juce::String& mode)
+    {
+        auto m = mode.trim().toLowerCase();
+        if (m == "major") return "major";
+        if (m == "minor") return "minor";
+        return "chromatic";
+    }
+
+    int modeToComboId(const juce::String& mode)
+    {
+        const auto m = normaliseKeyMode(mode);
+        if (m == "major") return 1;
+        if (m == "minor") return 2;
+        return 3;
+    }
+
+    juce::String comboIdToMode(int id)
+    {
+        if (id == 1) return "major";
+        if (id == 2) return "minor";
+        return "chromatic";
+    }
+
+    int rootToComboId(const juce::String& root)
+    {
+        const auto roots = getKeyRootsEnharmonic();
+        auto needle = root.trim().toUpperCase();
+        for (int i = 0; i < roots.size(); ++i)
+        {
+            auto label = roots[i].toUpperCase();
+            if (label == needle)
+                return i + 1;
+            if (label.contains("/"))
+            {
+                auto parts = juce::StringArray::fromTokens(label, "/", {});
+                for (auto& p : parts)
+                {
+                    if (p.trim() == needle)
+                        return i + 1;
+                }
+            }
+        }
+        return 1; // C
+    }
+
+    juce::String comboIdToRoot(int id)
+    {
+        const auto roots = getKeyRootsEnharmonic();
+        if (id <= 0 || id > roots.size())
+            return "C";
+        return roots[id - 1];
+    }
+}
 
 //==============================================================================
 // Project state mapping
@@ -18,6 +111,8 @@ ProjectState MainComponent::createProjectState() const
     s.bpm = bpm;
     s.bpmSet = bpmSet;
     s.metronomeOn = metronomeOn;
+    s.selectedKeyMode = selectedKeyMode;
+    s.selectedKeyRoot = selectedKeyRoot;
 
     s.currentPhraseIndex = currentPhraseIndex;
     s.currentPhraseDirectory = currentPhraseDirectory.getFullPathName();
@@ -47,6 +142,7 @@ ProjectState MainComponent::createProjectState() const
         CompSegmentState cs;
         cs.startSec = seg.startSec;
         cs.endSec = seg.endSec;
+        cs.sourceOffsetSec = seg.sourceOffsetSec;
         cs.takeIndex = seg.takeIndex;
         s.compSegments.add(cs);
     }
@@ -65,6 +161,54 @@ ProjectState MainComponent::createProjectState() const
         s.compBoundaries.add(bs);
     }
 
+    juce::Array<CompResult> saveResults = compResults;
+    if (activeCompResultIndex >= 0 && activeCompResultIndex < saveResults.size())
+    {
+        auto& active = saveResults.getReference(activeCompResultIndex);
+        active.compedFile = lastCompedFile;
+        active.compmapFile = lastCompmapFile;
+        active.alphaPct = lastCompAlphaPct;
+        active.crossfadePct = lastCompCrossfadePct;
+        active.fadeFraction = lastCompFadeFraction;
+        active.segments = compSegments;
+        active.boundaries = compBoundaries;
+        active.selected = compedSelected;
+        active.solo = compedSolo;
+    }
+
+    s.activeCompResultIndex = activeCompResultIndex;
+    for (const auto& r : saveResults)
+    {
+        CompResultState rs;
+        rs.hasResult = r.compedFile.existsAsFile() || r.compedFile.getFullPathName().isNotEmpty();
+        rs.compedFilePath = r.compedFile.getFullPathName();
+        rs.compmapFilePath = r.compmapFile.getFullPathName();
+        rs.alphaPct = r.alphaPct;
+        rs.crossfadePct = r.crossfadePct;
+        rs.fadeFraction = r.fadeFraction;
+        rs.selected = r.selected;
+        rs.solo = r.solo;
+
+        for (const auto& seg : r.segments)
+        {
+            CompSegmentState cs;
+            cs.startSec = seg.startSec;
+            cs.endSec = seg.endSec;
+            cs.sourceOffsetSec = seg.sourceOffsetSec;
+            cs.takeIndex = seg.takeIndex;
+            rs.segments.add(cs);
+        }
+        for (const auto& b : r.boundaries)
+        {
+            CompBoundaryState bs;
+            bs.leftSegIndex = b.leftSegIndex;
+            bs.xfadeStartSec = b.xfadeStartSec;
+            bs.xfadeEndSec = b.xfadeEndSec;
+            rs.boundaries.add(bs);
+        }
+        s.compResults.add(rs);
+    }
+
     return s;
 }
 
@@ -78,12 +222,17 @@ void MainComponent::resetProjectState()
 
     loopStartSec = 0.0;
     loopEndSec = 0.0;
+    visibleStartSec = 0.0;
+    visibleEndSec = 0.0;
 
     bpm = 120;
     bpmSet = false;
     metronomeOn = false;
+    selectedKeyMode = "chromatic";
+    selectedKeyRoot = "C";
 
     refreshBpmLabel();
+    refreshKeyLabel();
     metronomeToggle.setToggleState(false, juce::dontSendNotification);
     metronomeToggle.setEnabled(false);
 
@@ -127,6 +276,9 @@ void MainComponent::resetProjectState()
     hasCompedThumbnail = false;
     compedThumbnail.clear();
     compSegments.clear();
+    compResults.clear();
+    activeCompResultIndex = -1;
+    rebuildCompResultThumbnails();
     lastCompAlphaPct = 0;
     lastCompCrossfadePct = 0;
     lastCompFadeFraction = 0.0;
@@ -189,14 +341,23 @@ void MainComponent::applyProjectState(const ProjectState& s)
     
     gridOffsetSec = s.gridOffsetSec;
 
-    currentPhraseDirectory = juce::File(s.currentPhraseDirectory);
     currentPhraseIndex = s.currentPhraseIndex;
+    if (currentPhraseIndex <= 0)
+        currentPhraseIndex = 1;
+
+    currentPhraseDirectory = getValidPhraseDirectory(juce::File(s.currentPhraseDirectory),
+                                                     currentPhraseIndex);
 
     bpm = s.bpm;
     bpmSet = s.bpmSet;
     metronomeOn = s.metronomeOn;
+    selectedKeyMode = normaliseKeyMode(s.selectedKeyMode);
+    if (selectedKeyMode.isEmpty())
+        selectedKeyMode = "chromatic";
+    selectedKeyRoot = s.selectedKeyRoot.isEmpty() ? juce::String("C") : s.selectedKeyRoot;
     metronomeToggle.setToggleState(metronomeOn, juce::dontSendNotification);
     refreshBpmLabel();
+    refreshKeyLabel();
 
     loopStartSec = s.loopStartSec;
     loopEndSec = s.loopEndSec;
@@ -239,6 +400,9 @@ void MainComponent::applyProjectState(const ProjectState& s)
             loopEndSec = juce::jlimit(loopStartSec + minLoopLengthSec,
                 totalLengthSec,
                 loopEndSec);
+
+            visibleStartSec = 0.0;
+            visibleEndSec = totalLengthSec;
         }
     }
 
@@ -255,68 +419,106 @@ void MainComponent::applyProjectState(const ProjectState& s)
     takeVolumeSlider.setValue(vol, juce::dontSendNotification);
     takeTransport.setGain((float)vol);
 
-    hasLastCompResult = s.hasLastCompResult;
-    lastCompedFile = juce::File(s.lastCompedFilePath);
-    lastCompmapFile = juce::File(s.lastCompmapFilePath);
-    lastCompAlphaPct = s.lastCompAlphaPct;
-    lastCompCrossfadePct = s.lastCompCrossfadePct;
-    lastCompFadeFraction = s.lastCompFadeFraction;
-    compedSelected = s.compedSelected;
-    compedSolo = s.compedSolo;
-
-    compSegments.clear();
-    for (int i = 0; i < s.compSegments.size(); ++i)
+    compResults.clear();
+    if (!s.compResults.isEmpty())
     {
-        const auto& cs = s.compSegments.getReference(i);
-        CompSegment seg;
-        seg.startSec = cs.startSec;
-        seg.endSec = cs.endSec;
-        seg.takeIndex = cs.takeIndex;
-        compSegments.add(seg);
-    }
-
-    if (hasLastCompResult && lastCompedFile.existsAsFile())
-    {
-        loadCompedFile(lastCompedFile);
-
-        if (!loadLastCompForReview() && !s.compSegments.isEmpty())
+        const int count = juce::jmin(3, s.compResults.size());
+        for (int i = 0; i < count; ++i)
         {
-            compSegments.clear();
-            for (int i = 0; i < s.compSegments.size(); ++i)
+            const auto& rs = s.compResults.getReference(i);
+            if (!rs.compedFilePath.isNotEmpty())
+                continue;
+            CompResult r;
+            r.compedFile = juce::File(rs.compedFilePath);
+            r.compmapFile = juce::File(rs.compmapFilePath);
+            r.alphaPct = rs.alphaPct;
+            r.crossfadePct = rs.crossfadePct;
+            r.fadeFraction = rs.fadeFraction;
+            r.selected = rs.selected;
+            r.solo = rs.solo;
+
+            for (const auto& cs : rs.segments)
             {
-                const auto& cs = s.compSegments.getReference(i);
                 CompSegment seg;
                 seg.startSec = cs.startSec;
                 seg.endSec = cs.endSec;
+                seg.sourceOffsetSec = cs.sourceOffsetSec;
                 seg.takeIndex = cs.takeIndex;
-                compSegments.add(seg);
+                r.segments.add(seg);
             }
-            
-        
-        }
-        
-        // RESTORE manual crossfade boundaries from saved project
-        if (s.compBoundaries.size() == compSegments.size() - 1)
-        {
-            compBoundaries.clear();
-            for (const auto& bs : s.compBoundaries)
+            for (const auto& bs : rs.boundaries)
             {
                 CompBoundary cb;
                 cb.leftSegIndex = bs.leftSegIndex;
                 cb.xfadeStartSec = bs.xfadeStartSec;
                 cb.xfadeEndSec = bs.xfadeEndSec;
-                compBoundaries.add(cb);
+                r.boundaries.add(cb);
             }
-            updateCompedAuditionSourceFromEdits();
+            if (r.compedFile.getFullPathName().isNotEmpty())
+                compResults.add(r);
         }
+        activeCompResultIndex = juce::jlimit(0, juce::jmax(0, compResults.size() - 1), s.activeCompResultIndex);
+    }
+    else if (s.hasLastCompResult)
+    {
+        CompResult legacy;
+        legacy.compedFile = juce::File(s.lastCompedFilePath);
+        legacy.compmapFile = juce::File(s.lastCompmapFilePath);
+        legacy.alphaPct = s.lastCompAlphaPct;
+        legacy.crossfadePct = s.lastCompCrossfadePct;
+        legacy.fadeFraction = s.lastCompFadeFraction;
+        legacy.selected = s.compedSelected;
+        legacy.solo = s.compedSolo;
+        for (const auto& cs : s.compSegments)
+        {
+            CompSegment seg;
+            seg.startSec = cs.startSec;
+            seg.endSec = cs.endSec;
+            seg.sourceOffsetSec = cs.sourceOffsetSec;
+            seg.takeIndex = cs.takeIndex;
+            legacy.segments.add(seg);
+        }
+        for (const auto& bs : s.compBoundaries)
+        {
+            CompBoundary cb;
+            cb.leftSegIndex = bs.leftSegIndex;
+            cb.xfadeStartSec = bs.xfadeStartSec;
+            cb.xfadeEndSec = bs.xfadeEndSec;
+            legacy.boundaries.add(cb);
+        }
+        compResults.add(legacy);
+        activeCompResultIndex = 0;
+    }
 
-        hasLastCompResult = true;
+    hasLastCompResult = !compResults.isEmpty();
+    if (hasLastCompResult)
+    {
+        setActiveCompResult(activeCompResultIndex, false);
+        // Prefer CompedAuditionSource (device sample rate) when we have segments; use file only when no compmap.
+        if (compSegments.isEmpty() && lastCompmapFile.existsAsFile())
+            loadLastCompForReview();
+        else if (!compSegments.isEmpty())
+        {
+            prepareCompedAuditionSource();
+            if (lastCompmapFile.existsAsFile())
+            {
+                juce::FileInputStream in(lastCompmapFile);
+                if (in.openedOk())
+                {
+                    auto jsonVar = juce::JSON::parse(in);
+                    if (jsonVar.isObject())
+                        compmapJsonCache = jsonVar;
+                }
+            }
+        }
+        else if (lastCompedFile.existsAsFile())
+            loadCompedFile(lastCompedFile);
         compedTabButton.setEnabled(true);
     }
     else
     {
-        hasLastCompResult = false;
         compedTabButton.setEnabled(false);
+        rebuildCompResultThumbnails();
     }
 
     viewMode = (s.viewIsCompReview && hasLastCompResult)
@@ -342,6 +544,8 @@ void MainComponent::applyProjectState(const ProjectState& s)
 
 void MainComponent::saveProjectToFile()
 {
+    currentPhraseDirectory = getValidPhraseDirectory(currentPhraseDirectory, currentPhraseIndex);
+
     ProjectState state = createProjectState();
 
     juce::File defaultFile = currentPhraseDirectory
@@ -400,9 +604,11 @@ void MainComponent::saveProjectToFile()
 
 void MainComponent::launchProjectLoadChooser()
 {
+    auto chooserStartDir = getValidPhraseDirectory(currentPhraseDirectory, currentPhraseIndex);
+
     fileChooser = std::make_unique<juce::FileChooser>(
         "Load project...",
-        currentPhraseDirectory,
+        chooserStartDir,
         "*.json");
 
     auto flags = juce::FileBrowserComponent::openMode
@@ -525,7 +731,7 @@ void MainComponent::promptForBpm()
 {
     auto* w = new juce::AlertWindow("Set BPM", {}, juce::AlertWindow::NoIcon);
 
-    w->setSize(420, 220);
+    w->setSize(450, 310);
 
     // ---- full‑width centred message ----
     auto* msg = new juce::Label();
@@ -544,6 +750,31 @@ void MainComponent::promptForBpm()
     if (auto* editor = w->getTextEditor("bpm"))
         editor->setJustification(juce::Justification::centred);
 
+    w->addComboBox("key_mode", getKeyModes(), "Mode:");
+    if (auto* modeBox = w->getComboBoxComponent("key_mode"))
+    {
+        modeBox->setSelectedId(modeToComboId(selectedKeyMode), juce::dontSendNotification);
+    }
+
+    w->addComboBox("key_root", getKeyRootsEnharmonic(), "Key:");
+    if (auto* rootBox = w->getComboBoxComponent("key_root"))
+    {
+        rootBox->setSelectedId(rootToComboId(selectedKeyRoot), juce::dontSendNotification);
+    }
+
+    if (auto* modeBox = w->getComboBoxComponent("key_mode"))
+    {
+        modeBox->onChange = [w]()
+        {
+            auto* mode = w->getComboBoxComponent("key_mode");
+            auto* root = w->getComboBoxComponent("key_root");
+            if (mode == nullptr || root == nullptr)
+                return;
+            root->setEnabled(comboIdToMode(mode->getSelectedId()) != "chromatic");
+        };
+        modeBox->onChange();
+    }
+
     w->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
 
     w->centreAroundComponent(this, w->getWidth(), w->getHeight());
@@ -560,6 +791,12 @@ void MainComponent::promptForBpm()
                 bpm = juce::jlimit(40, 240, value);
                 bpmSet = true;
                 refreshBpmLabel();
+
+                if (auto* modeBox = w->getComboBoxComponent("key_mode"))
+                    selectedKeyMode = comboIdToMode(modeBox->getSelectedId());
+                if (auto* rootBox = w->getComboBoxComponent("key_root"))
+                    selectedKeyRoot = comboIdToRoot(rootBox->getSelectedId());
+                refreshKeyLabel();
             }
             else
             {
@@ -570,8 +807,67 @@ void MainComponent::promptForBpm()
         true);
 }
 
+void MainComponent::promptForKeySelection()
+{
+    auto* w = new juce::AlertWindow("Set Key", {}, juce::AlertWindow::NoIcon);
+    w->setSize(360, 180);
+
+    w->addComboBox("key_mode", getKeyModes(), "Mode:");
+    if (auto* modeBox = w->getComboBoxComponent("key_mode"))
+        modeBox->setSelectedId(modeToComboId(selectedKeyMode), juce::dontSendNotification);
+
+    w->addComboBox("key_root", getKeyRootsEnharmonic(), "Key:");
+    if (auto* rootBox = w->getComboBoxComponent("key_root"))
+        rootBox->setSelectedId(rootToComboId(selectedKeyRoot), juce::dontSendNotification);
+
+    if (auto* modeBox = w->getComboBoxComponent("key_mode"))
+    {
+        modeBox->onChange = [w]()
+        {
+            auto* mode = w->getComboBoxComponent("key_mode");
+            auto* root = w->getComboBoxComponent("key_root");
+            if (mode == nullptr || root == nullptr)
+                return;
+            root->setEnabled(comboIdToMode(mode->getSelectedId()) != "chromatic");
+        };
+        modeBox->onChange();
+    }
+
+    w->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    w->centreAroundComponent(this, w->getWidth(), w->getHeight());
+
+    w->enterModalState(true,
+        juce::ModalCallbackFunction::create([this, w](int result)
+        {
+            if (result == 1)
+            {
+                if (auto* modeBox = w->getComboBoxComponent("key_mode"))
+                    selectedKeyMode = comboIdToMode(modeBox->getSelectedId());
+                if (auto* rootBox = w->getComboBoxComponent("key_root"))
+                    selectedKeyRoot = comboIdToRoot(rootBox->getSelectedId());
+                refreshKeyLabel();
+            }
+        }),
+        true);
+}
+
 void MainComponent::refreshBpmLabel()
 {
     bpmLabel.setText("BPM: " + juce::String(bpm),
         juce::dontSendNotification);
+}
+
+void MainComponent::refreshKeyLabel()
+{
+    const auto mode = normaliseKeyMode(selectedKeyMode);
+    if (mode == "chromatic")
+    {
+        keyLabel.setText("Key: Chromatic", juce::dontSendNotification);
+        return;
+    }
+
+    const auto modeUi = (mode == "major") ? juce::String("Major") : juce::String("Minor");
+    const auto rootUi = selectedKeyRoot.isEmpty() ? juce::String("C") : selectedKeyRoot;
+    keyLabel.setText("Key: " + rootUi + " " + modeUi, juce::dontSendNotification);
 }

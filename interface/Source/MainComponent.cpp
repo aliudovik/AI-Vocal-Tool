@@ -138,6 +138,8 @@ void setupPythonEnv()
 MainComponent::MainComponent()
 {
     setLookAndFeel(&neonLookAndFeel);
+    setWantsKeyboardFocus(true);
+    setMouseClickGrabsKeyboardFocus(true);
 
 
 
@@ -174,7 +176,8 @@ MainComponent::MainComponent()
     setAudioChannels(1, 2);
 
     AppPaths::ensureFoldersExist();
-    AppPaths::root().setAsCurrentWorkingDirectory();
+    if (!AppPaths::workingDataDir().setAsCurrentWorkingDirectory())
+        AppPaths::root().setAsCurrentWorkingDirectory();
 
     // Initialise data_pilot/singer_user/phraseXX for this session
     initialiseUserPhraseDirectory();
@@ -187,6 +190,7 @@ MainComponent::MainComponent()
     addAndMakeVisible(stopButton);
     addAndMakeVisible(resetButton);
     addAndMakeVisible(bpmLabel);
+    addAndMakeVisible(keyLabel);
     addAndMakeVisible(metronomeToggle);
     addAndMakeVisible(recordButton);
     addAndMakeVisible(ioButton);
@@ -206,19 +210,25 @@ MainComponent::MainComponent()
     addAndMakeVisible(crossfadeRightLabel);
     // Scrollable takes view (Recording tab)
     addAndMakeVisible(takesViewport);
-    addAndMakeVisible(compedSelectButton);
-    addAndMakeVisible(compedSoloButton);
+    for (int i = 0; i < 3; ++i)
+    {
+        auto* selectBtn = new NeonButton("Select");
+        auto* soloBtn = new NeonButton("Solo");
+
+        selectBtn->setClickingTogglesState(true);
+        soloBtn->setClickingTogglesState(true);
+        selectBtn->addListener(this);
+        soloBtn->addListener(this);
+
+        compedSelectButtons.add(selectBtn);
+        compedSoloButtons.add(soloBtn);
+        addAndMakeVisible(selectBtn);
+        addAndMakeVisible(soloBtn);
+    }
     // MainComponent_Views.cpp  (inside MainComponent constructor)
     addAndMakeVisible(mlModeToggle);
     mlModeToggle.setButtonText("Use ML Scoring (experimental)");
     mlModeToggle.setToggleState(false, juce::dontSendNotification);
-
-    compedSelectButton.setClickingTogglesState(true);
-    compedSoloButton.setClickingTogglesState(true);
-
-    compedSelectButton.addListener(this);
-    compedSoloButton.addListener(this);
-
 
     takesViewport.setViewedComponent(&takesContainer, false);
     takesViewport.setScrollBarsShown(true, false);
@@ -252,6 +262,9 @@ MainComponent::MainComponent()
     bpmLabel.setJustificationType(juce::Justification::centredLeft);
     bpmLabel.setInterceptsMouseClicks(false, false);
     refreshBpmLabel();
+    keyLabel.setJustificationType(juce::Justification::centredLeft);
+    keyLabel.setInterceptsMouseClicks(false, false);
+    refreshKeyLabel();
 
     // "Select Take" label
     //selectTakeLabel.setText("Select", juce::dontSendNotification);
@@ -493,8 +506,8 @@ void MainComponent::restartPlaybackForCompEdit()
     takeTransport.stop();
 
     // reset positions
-    transportSource.setPosition(loopStartSec); // or 0.0 if you want absolute start
-    takeTransport.setPosition(0.0);
+    transportSource.setPosition(getEffectiveLoopStartSec());
+    takeTransport.setPosition(getEffectiveCompLoopStartSec());
 
     if (wasPlaying)
     {
@@ -510,8 +523,8 @@ void MainComponent::restartCompPlaybackIfPlaying()
     transportSource.stop();
     takeTransport.stop();
 
-    transportSource.setPosition(loopStartSec); // or 0.0 if you want absolute start
-    takeTransport.setPosition(0.0);
+    transportSource.setPosition(getEffectiveLoopStartSec());
+    takeTransport.setPosition(getEffectiveCompLoopStartSec());
 
     if (wasPlaying)
     {

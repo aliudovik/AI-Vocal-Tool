@@ -274,10 +274,67 @@ double MainComponent::getPlayheadPositionSec() const
     return 0.0;
 }
 
+double MainComponent::getEffectiveLoopStartSec() const
+{
+    if (!hasValidLoop())
+        return 0.0;
+
+    const double totalLength = thumbnail.getTotalLength();
+    if (viewMode == ViewMode::CompReview
+        && totalLength > 0.0
+        && visibleEndSec > visibleStartSec + 0.0001)
+    {
+        const double visibleSpan = visibleEndSec - visibleStartSec;
+        if (visibleSpan < totalLength - 0.0001)
+            return juce::jlimit(0.0, totalLength, visibleStartSec);
+    }
+
+    return loopStartSec;
+}
+
+double MainComponent::getEffectiveLoopEndSec() const
+{
+    if (!hasValidLoop())
+        return 0.0;
+
+    const double totalLength = thumbnail.getTotalLength();
+    if (viewMode == ViewMode::CompReview
+        && totalLength > 0.0
+        && visibleEndSec > visibleStartSec + 0.0001)
+    {
+        const double visibleSpan = visibleEndSec - visibleStartSec;
+        if (visibleSpan < totalLength - 0.0001)
+            return juce::jlimit(getEffectiveLoopStartSec() + 0.0001, totalLength, visibleEndSec);
+    }
+
+    return loopEndSec;
+}
+
+double MainComponent::getEffectiveCompLoopStartSec() const
+{
+    const double compLength = juce::jmax(compedThumbnail.getTotalLength(), loopEndSec - loopStartSec);
+    if (compLength <= 0.0)
+        return 0.0;
+
+    const double rel = getEffectiveLoopStartSec() - loopStartSec;
+    return juce::jlimit(0.0, compLength, rel);
+}
+
+double MainComponent::getEffectiveCompLoopEndSec() const
+{
+    const double compLength = juce::jmax(compedThumbnail.getTotalLength(), loopEndSec - loopStartSec);
+    if (compLength <= 0.0)
+        return 0.0;
+
+    const double rel = getEffectiveLoopEndSec() - loopStartSec;
+    return juce::jlimit(getEffectiveCompLoopStartSec() + 0.0001, compLength, rel);
+}
+
 void MainComponent::startPlaybackForSelection(bool playInstrumental, bool playTake)
 {
     const bool loop = hasValidLoop();
-    const double startSec = loop ? loopStartSec : 0.0;
+    const double startSec = loop ? getEffectiveLoopStartSec() : 0.0;
+    const double takeStartSec = loop ? getEffectiveCompLoopStartSec() : 0.0;
 
     if (playInstrumental && readerSource != nullptr)
     {
@@ -291,7 +348,7 @@ void MainComponent::startPlaybackForSelection(bool playInstrumental, bool playTa
 
     if (playTake && (takeReaderSource != nullptr || compedAuditionSource != nullptr))
     {
-        takeTransport.setPosition(0.0); // takes are aligned to loop
+        takeTransport.setPosition(takeStartSec); // takes are aligned to the effective loop
         takeTransport.start();
     }
     else
@@ -311,11 +368,18 @@ void MainComponent::enforceLoopWrap()
     if (!hasValidLoop())
         return;
 
-    const double pos = getPlayheadPositionSec();
-    if (pos >= loopEndSec)
+    const double effectiveStart = getEffectiveLoopStartSec();
+    const double effectiveEnd = getEffectiveLoopEndSec();
+
+    if (transportSource.isPlaying() && transportSource.getCurrentPosition() >= effectiveEnd)
+        transportSource.setPosition(effectiveStart);
+
+    if (takeTransport.isPlaying())
     {
-        transportSource.setPosition(loopStartSec);
-        takeTransport.setPosition(0.0);
+        const double compStart = getEffectiveCompLoopStartSec();
+        const double compEnd = getEffectiveCompLoopEndSec();
+        if (takeTransport.getCurrentPosition() >= compEnd)
+            takeTransport.setPosition(compStart);
     }
 }
 
@@ -451,8 +515,10 @@ void MainComponent::stopRecording()
                     int64 pos = 0;
                     while (pos < originalSamples)
                     {
-                        const int64 samplesThisBlock =
-                            juce::jmin<int64>(blockSize, originalSamples - pos);
+                        const int64 remaining = originalSamples - pos;
+                        const int64 samplesThisBlock = (remaining < (int64) blockSize)
+                            ? remaining
+                            : (int64) blockSize;
                         copyBuffer.clear();
 
                         reader->read(&copyBuffer,
@@ -658,6 +724,8 @@ void MainComponent::importInstrumental()
             loopStartSec = 0.0;
             loopEndSec = totalLengthSec;
             minLoopLengthSec = juce::jmin(5.0, totalLengthSec);
+            visibleStartSec = 0.0;
+            visibleEndSec = totalLengthSec;
 
             if (!bpmSet)
                 promptForBpm();
@@ -1063,7 +1131,9 @@ void MainComponent::splitFullRecordingIntoTakes(const juce::File& fullFile, int 
 
         while (remaining > 0)
         {
-            const int64 thisBlock = juce::jmin<int64>(blockSize, remaining);
+            const int64 thisBlock = (remaining < (int64) blockSize)
+                ? remaining
+                : (int64) blockSize;
             tempBuffer.clear();
 
             reader->read(&tempBuffer,

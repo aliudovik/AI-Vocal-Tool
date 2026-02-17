@@ -3,6 +3,7 @@
 #include <JuceHeader.h>
 #include "ProjectState.h"
 #include "NeonUI.h"
+#include <array>
 
 
 // Main component:
@@ -55,6 +56,7 @@ public:
 
     // Button::Listener
     void buttonClicked(juce::Button* button) override;
+    bool keyPressed(const juce::KeyPress& key) override;
 
     // Timer (for moving playhead & handling loop wrap)
     void timerCallback() override;
@@ -67,6 +69,8 @@ public:
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;
     void mouseMove(const juce::MouseEvent& event) override;
+    void mouseWheelMove(const juce::MouseEvent& event,
+                        const juce::MouseWheelDetails& wheel) override;
     
     void promptSaveOnExit();
     
@@ -102,6 +106,7 @@ private:
     juce::TextButton loadProjectButton{ "Load Project" };
 
     juce::Label        bpmLabel;
+    juce::Label        keyLabel;
     juce::ToggleButton metronomeToggle{ "Metronome" };
     juce::Label        takeVolumeLabel;
     juce::Slider       takeVolumeSlider;
@@ -136,6 +141,7 @@ private:
     juce::Rectangle<int> instrumentalLabelBounds;
     juce::Rectangle<int> instrumentalWaveformBounds;
     juce::Rectangle<int> bpmBounds;
+    juce::Rectangle<int> keyBounds;
     juce::Rectangle<int> takesAreaBounds;
     juce::Rectangle<int> compExportArea;
 
@@ -144,7 +150,7 @@ private:
     juce::AudioThumbnailCache thumbnailCache{ 10 };
     juce::AudioThumbnail      thumbnail{ 512, formatManager, thumbnailCache };
 
-    // Comped review state  // NEW
+    // Comped review state
     juce::AudioThumbnail compedThumbnail{ 512, formatManager, thumbnailCache }; // NEW
     bool hasCompedThumbnail = false;
     
@@ -154,9 +160,10 @@ private:
     {                        // NEW
         double startSec = 0.0;  // NEW
         double endSec = 0.0;  // NEW
+        double sourceOffsetSec = 0.0;
         int    takeIndex = -1;  // NEW  e.g. 3 for "take_3" // NEW
     };                       // NEW
-    juce::Array<CompSegment> compSegments;   // NEW
+    juce::Array<CompSegment> compSegments;   // active comp result only
 
     std::unique_ptr<juce::AudioFormatReaderSource> readerSource;
     std::unique_ptr<CompedAuditionSource> compedAuditionSource;
@@ -173,7 +180,7 @@ private:
         int    leftSegIndex = -1;
     };
 
-    juce::Array<CompBoundary> compBoundaries;
+    juce::Array<CompBoundary> compBoundaries; // active comp result only
     
     juce::ChildProcess mlServerProcess;
 
@@ -181,9 +188,12 @@ private:
     juce::var compmapJsonCache;
 
     // Drag state for Comped-tab crossfade handles (separate from loop handles)
-    enum class CompDragMode { None, XFadeStart, XFadeEnd, SegmentBoundary };
+    enum class CompDragMode { None, XFadeStart, XFadeEnd, SegmentBoundary, SegmentSlip };
     int activeBoundaryIndex = -1;
+    int activeSegmentIndex = -1;
     CompDragMode compDragMode = CompDragMode::None;
+    double segmentSlipDragStartMouseSec = 0.0;
+    double segmentSlipDragStartOffsetSec = 0.0;
 
 
     // Recording writer for full_N.wav
@@ -197,9 +207,12 @@ private:
     bool gridTooltipDismissed = false; // Has user performed the action yet?
     bool isHoveringInstrumental = false;
     juce::Point<int> lastMousePosition;
+    bool segmentTimingTipShownOnce = false;
+    double segmentTimingTipShowUntilMs = 0.0;
+    bool zoomScaleTipShownOnce = false;
+    double zoomScaleTipShowUntilMs = 0.0;
 
-    // Last comping result (for the Comped tab later)
-        // Last comping result (for the Comped tab later)
+    // Last/active comping result (for the Comped tab)
     juce::File lastCompedFile;
     juce::File lastCompmapFile;
     int        lastCompAlphaPct = 0;       // 0..100 (Accuracy)
@@ -210,13 +223,35 @@ private:
 
     // State for the single comped row in the CompReview view
     bool       compedSelected = true;      // play with instrumental
-    bool       compedSolo = false;     // play comped only
+    bool       compedSolo = false;         // play comped only
+
+    struct CompResult
+    {
+        juce::File compedFile;
+        juce::File compmapFile;
+        int alphaPct = 0;
+        int crossfadePct = 0;
+        double fadeFraction = 0.0;
+
+        juce::Array<CompSegment> segments;
+        juce::Array<CompBoundary> boundaries;
+        juce::var compmapJson;
+
+        bool selected = true;
+        bool solo = false;
+    };
+
+    juce::Array<CompResult> compResults;
+    int activeCompResultIndex = -1;
+    static constexpr int kMaxCompResultRows = 3;
+    std::array<std::unique_ptr<juce::AudioThumbnail>, kMaxCompResultRows> compResultThumbnails;
 
     // Comped view helpers
     juce::Colour getColourForTake(int takeIndex) const;
     void drawCompedTopBar(juce::Graphics& g,
                           const juce::Rectangle<int>& topBar,
-                          const juce::Rectangle<int>& compWaveArea);
+                          const juce::Rectangle<int>& compWaveArea,
+                          int compResultIndex);
 
     void drawZebraStripes(juce::Graphics& g,
                           const juce::Rectangle<int>& r,
@@ -224,9 +259,10 @@ private:
                           juce::Colour c2) const;
 
     void drawCompedWaveformRealtime(juce::Graphics& g,
-                                    const juce::Rectangle<int>& area);
+                                    const juce::Rectangle<int>& area,
+                                    int compResultIndex);
 
-    float renderCompSampleAtTime(double tSec, int& cachedSeg) const;
+    float renderCompSampleAtTime(double tSec, int& cachedSeg, int compResultIndex) const;
     
     // MainComponent.h  (add to private section)
     bool buildCompedAuditionSourceForExport(std::unique_ptr<CompedAuditionSource>& outSource,
@@ -244,11 +280,19 @@ private:
 
     // For correct clamping
     void sanitizeCompSegments();
+    void rebuildCompResultThumbnails();
+    void syncActiveCompResultFromLegacyState();
+    void syncLegacyStateFromActiveCompResult();
+    bool setActiveCompResult(int index, bool prepareAudition);
+    juce::String getCompResultTitle(int index) const;
+    int getCompResultCount() const noexcept { return compResults.size(); }
 
     // Loop selection in seconds (Ableton-style arrangement loop)
     double loopStartSec = 0.0;
     double loopEndSec = 0.0;
     double minLoopLengthSec = 5.0;  // minimum loop length
+    double visibleStartSec = 0.0;   // shared horizontal zoom start (project time)
+    double visibleEndSec = 0.0;     // shared horizontal zoom end (project time)
 
     enum class DragMode { none, leftHandle, rightHandle, bpmAdjust, gridAdjust };
     DragMode dragMode = DragMode::none;
@@ -285,6 +329,10 @@ private:
     void stopAllPlayback();
     bool isSoloPlayback() const;
     double getPlayheadPositionSec() const;
+    double getEffectiveLoopStartSec() const;
+    double getEffectiveLoopEndSec() const;
+    double getEffectiveCompLoopStartSec() const;
+    double getEffectiveCompLoopEndSec() const;
     void enforceLoopWrap();
     
     
@@ -308,6 +356,12 @@ private:
     void refreshTakeLaneSelectionStates();
     void updateTakeLanePlayhead(double globalTimeSeconds);
     void refreshCompedButtons();
+    void getCompRowLayout(int rowIndex,
+        int rowCount,
+        juce::Rectangle<int>& row,
+        juce::Rectangle<int>& labelRect,
+        juce::Rectangle<int>& waveRect,
+        juce::Rectangle<int>& controlsRect) const;
     void getCompRowLayout(juce::Rectangle<int>& row,
         juce::Rectangle<int>& labelRect,
         juce::Rectangle<int>& waveRect,
@@ -326,6 +380,8 @@ private:
     int  bpm = 120;
     bool bpmSet = false;
     bool metronomeOn = false;
+    juce::String selectedKeyMode = "chromatic"; // major/minor/chromatic
+    juce::String selectedKeyRoot = "C";
 
     // For vertical-drag BPM adjust
     int bpmDragStartY = 0;
@@ -342,8 +398,8 @@ private:
     int        currentPhraseIndex = 1;
 
     // --- Comped-tab lane controls ---
-    NeonButton compedSelectButton{ "Select" };
-    NeonButton compedSoloButton{ "Solo" };
+    juce::OwnedArray<NeonButton> compedSelectButtons;
+    juce::OwnedArray<NeonButton> compedSoloButtons;
 
 
     // Async file chooser
@@ -379,9 +435,11 @@ private:
 
     // Prompt for BPM after importing
     void promptForBpm();
+    void promptForKeySelection();
 
     // Update BPM label text
     void refreshBpmLabel();
+    void refreshKeyLabel();
 
     // View-specific painting/layout helpers
     void paintRecordingView(juce::Graphics& g);

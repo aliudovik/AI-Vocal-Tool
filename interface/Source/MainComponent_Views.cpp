@@ -128,12 +128,15 @@ void MainComponent::paintRecordingView(juce::Graphics& g)
     if (totalLength > 0.0)
     {
         auto innerBounds = instrumentalWaveformBounds.reduced(2);
+        const double viewStart = juce::jlimit(0.0, totalLength, visibleStartSec);
+        const double viewEnd = juce::jlimit(viewStart + 0.0001, totalLength, visibleEndSec);
+        const double viewSpan = juce::jmax(0.0001, viewEnd - viewStart);
 
         g.setColour(juce::Colours::darkgrey.brighter(0.3f));
         thumbnail.drawChannel(g,
             innerBounds,
-            0.0,
-            totalLength,
+            viewStart,
+            viewEnd,
             0,
             1.0f);
 
@@ -145,8 +148,10 @@ void MainComponent::paintRecordingView(juce::Graphics& g)
 
         if (hasValidLoop())
         {
-            const double startProp = juce::jlimit(0.0, 1.0, loopStartSec / totalLength);
-            const double endProp = juce::jlimit(0.0, 1.0, loopEndSec / totalLength);
+            const double loopVisStart = juce::jmax(loopStartSec, viewStart);
+            const double loopVisEnd = juce::jmin(loopEndSec, viewEnd);
+            const double startProp = juce::jlimit(0.0, 1.0, (loopVisStart - viewStart) / viewSpan);
+            const double endProp = juce::jlimit(0.0, 1.0, (loopVisEnd - viewStart) / viewSpan);
 
             const int totalW = innerBounds.getWidth();
 
@@ -160,20 +165,23 @@ void MainComponent::paintRecordingView(juce::Graphics& g)
                 loopW,
                 innerBounds.getHeight());
 
-            g.setColour(juce::Colours::lightgreen);
-            thumbnail.drawChannel(g,
-                loopRect,
-                loopStartSec,
-                loopEndSec,
-                0,
-                1.0f);
+            if (loopVisEnd > loopVisStart + 0.0001)
+            {
+                g.setColour(juce::Colours::lightgreen);
+                thumbnail.drawChannel(g,
+                    loopRect,
+                    loopVisStart,
+                    loopVisEnd,
+                    0,
+                    1.0f);
+            }
         }
 
         const double current = getPlayheadPositionSec();
         if (current >= 0.0 && totalLength > 0.0)
         {
             const double proportion =
-                juce::jlimit(0.0, 1.0, current / totalLength);
+                juce::jlimit(0.0, 1.0, (current - viewStart) / viewSpan);
 
             const int x = instrumentalWaveformBounds.getX()
                 + juce::roundToInt(proportion
@@ -194,26 +202,39 @@ void MainComponent::paintRecordingView(juce::Graphics& g)
 
             const float topY = (float)instrumentalWaveformBounds.getY();
             const float bottomY = (float)instrumentalWaveformBounds.getBottom();
+            const int viewLeft = instrumentalWaveformBounds.getX();
+            const int viewRight = instrumentalWaveformBounds.getRight();
 
             g.setColour(juce::Colours::red);
 
-            g.drawLine((float)xStart, topY, (float)xStart, bottomY, 2.0f);
-            g.drawLine((float)xEnd, topY, (float)xEnd, bottomY, 2.0f);
+            const bool drawStart = (xStart >= viewLeft && xStart <= viewRight);
+            const bool drawEnd = (xEnd >= viewLeft && xEnd <= viewRight);
+
+            if (drawStart)
+                g.drawLine((float)xStart, topY, (float)xStart, bottomY, 2.0f);
+            if (drawEnd)
+                g.drawLine((float)xEnd, topY, (float)xEnd, bottomY, 2.0f);
 
             const float arrowHeight = 10.0f;
             const float arrowHalfW = 6.0f;
 
-            juce::Path startArrow;
-            startArrow.addTriangle((float)xStart, topY,
-                (float)xStart - arrowHalfW, topY - arrowHeight,
-                (float)xStart + arrowHalfW, topY - arrowHeight);
-            g.fillPath(startArrow);
+            if (drawStart)
+            {
+                juce::Path startArrow;
+                startArrow.addTriangle((float)xStart, topY,
+                    (float)xStart - arrowHalfW, topY - arrowHeight,
+                    (float)xStart + arrowHalfW, topY - arrowHeight);
+                g.fillPath(startArrow);
+            }
 
-            juce::Path endArrow;
-            endArrow.addTriangle((float)xEnd, topY,
-                (float)xEnd - arrowHalfW, topY - arrowHeight,
-                (float)xEnd + arrowHalfW, topY - arrowHeight);
-            g.fillPath(endArrow);
+            if (drawEnd)
+            {
+                juce::Path endArrow;
+                endArrow.addTriangle((float)xEnd, topY,
+                    (float)xEnd - arrowHalfW, topY - arrowHeight,
+                    (float)xEnd + arrowHalfW, topY - arrowHeight);
+                g.fillPath(endArrow);
+            }
         }
     }
     else
@@ -362,18 +383,33 @@ void MainComponent::drawZebraStripes(juce::Graphics& g,
 
 void MainComponent::drawCompedTopBar(juce::Graphics& g,
                                      const juce::Rectangle<int>& topBar,
-                                     const juce::Rectangle<int>& compWaveArea)
+                                     const juce::Rectangle<int>& compWaveArea,
+                                     int compResultIndex)
 {
     g.setColour(juce::Colours::black.withAlpha(0.6f));
     g.fillRect(topBar);
+    juce::Graphics::ScopedSaveState ss(g);
+    g.reduceClipRegion(topBar);
 
-    if (compSegments.isEmpty())
+    const bool useActive = (compResultIndex == activeCompResultIndex);
+    const auto& rowSegments = useActive
+        ? compSegments
+        : compResults.getReference(compResultIndex).segments;
+    const auto& rowBoundaries = useActive
+        ? compBoundaries
+        : compResults.getReference(compResultIndex).boundaries;
+    const bool rowSelected =
+        (compResultIndex >= 0 && compResultIndex < compResults.size())
+            ? compResults.getReference(compResultIndex).selected
+            : true;
+
+    if (rowSegments.isEmpty())
         return;
 
     // 1) Fill each segment with its take colour
-    for (int i = 0; i < compSegments.size(); ++i)
+    for (int i = 0; i < rowSegments.size(); ++i)
     {
-        const auto& seg = compSegments.getReference(i);
+        const auto& seg = rowSegments.getReference(i);
         int x1 = compedTimeToX(seg.startSec, compWaveArea);
         int x2 = compedTimeToX(seg.endSec, compWaveArea);
 
@@ -382,13 +418,19 @@ void MainComponent::drawCompedTopBar(juce::Graphics& g,
         juce::Rectangle<int> r(x1, topBar.getY(), x2 - x1, topBar.getHeight());
         g.setColour(getColourForTake(seg.takeIndex));
         g.fillRect(r);
+
+        if (useActive && compDragMode == CompDragMode::SegmentSlip && activeSegmentIndex == i)
+        {
+            g.setColour(juce::Colours::white.withAlpha(0.95f));
+            g.drawRect(r, 2);
+        }
     }
 
     // 2) Overlay zebra stripes in crossfade zones
-    for (int b = 0; b < compBoundaries.size(); ++b)
+    for (int b = 0; b < rowBoundaries.size(); ++b)
     {
-        const auto& cb = compBoundaries.getReference(b);
-        if (b + 1 >= compSegments.size()) continue;
+        const auto& cb = rowBoundaries.getReference(b);
+        if (b + 1 >= rowSegments.size()) continue;
 
         int xs = compedTimeToX(cb.xfadeStartSec, compWaveArea);
         int xe = compedTimeToX(cb.xfadeEndSec, compWaveArea);
@@ -397,16 +439,28 @@ void MainComponent::drawCompedTopBar(juce::Graphics& g,
         juce::Rectangle<int> r(xs, topBar.getY(), xe - xs, topBar.getHeight());
 
         drawZebraStripes(g, r,
-                         getColourForTake(compSegments[b].takeIndex),
-                         getColourForTake(compSegments[b + 1].takeIndex));
+                         getColourForTake(rowSegments[b].takeIndex),
+                         getColourForTake(rowSegments[b + 1].takeIndex));
     }
 
     g.setColour(juce::Colours::black.withAlpha(0.5f));
     g.drawRect(topBar);
+
+    // De-emphasize headers of deselected comp rows for visual clarity.
+    if (!rowSelected)
+    {
+        g.setColour(juce::Colours::darkgrey.withAlpha(0.62f));
+        g.fillRect(topBar);
+        g.setColour(juce::Colours::grey.withAlpha(0.45f));
+        g.drawRect(topBar);
+    }
 }
 
-float MainComponent::renderCompSampleAtTime(double tSec, int& cachedSeg) const
+float MainComponent::renderCompSampleAtTime(double tSec, int& cachedSeg, int compResultIndex) const
 {
+    if (compResultIndex != activeCompResultIndex)
+        return 0.0f;
+
     if (compSegments.isEmpty() || compedAuditionSource == nullptr)
         return 0.0f;
 
@@ -421,8 +475,10 @@ float MainComponent::renderCompSampleAtTime(double tSec, int& cachedSeg) const
     cachedSeg = juce::jlimit(0, compSegments.size() - 1, cachedSeg);
 
     int seg = cachedSeg;
+    const auto& segState = compSegments.getReference(seg);
+    const double sourceSec = tSec + segState.sourceOffsetSec;
     float sample = compedAuditionSource
-        ->readSampleAtTime(compSegments.getReference(seg).takeIndex, tSec);
+        ->readSampleAtTime(segState.takeIndex, sourceSec);
 
     auto applyBoundary = [&](int b) -> bool
     {
@@ -441,10 +497,13 @@ float MainComponent::renderCompSampleAtTime(double tSec, int& cachedSeg) const
         if (right >= compSegments.size())
             return false;
 
-        float a = compedAuditionSource->readSampleAtTime(
-            compSegments.getReference(left).takeIndex, tSec);
-        float bS = compedAuditionSource->readSampleAtTime(
-            compSegments.getReference(right).takeIndex, tSec);
+        const auto& leftSeg = compSegments.getReference(left);
+        const auto& rightSeg = compSegments.getReference(right);
+        const double leftSourceSec = tSec + leftSeg.sourceOffsetSec;
+        const double rightSourceSec = tSec + rightSeg.sourceOffsetSec;
+
+        float a = compedAuditionSource->readSampleAtTime(leftSeg.takeIndex, leftSourceSec);
+        float bS = compedAuditionSource->readSampleAtTime(rightSeg.takeIndex, rightSourceSec);
 
         const double u = juce::jlimit(0.0, 1.0,
             (tSec - cb.xfadeStartSec) / (cb.xfadeEndSec - cb.xfadeStartSec));
@@ -463,12 +522,43 @@ float MainComponent::renderCompSampleAtTime(double tSec, int& cachedSeg) const
 }
 
 void MainComponent::drawCompedWaveformRealtime(juce::Graphics& g,
-                                               const juce::Rectangle<int>& area)
+                                               const juce::Rectangle<int>& area,
+                                               int compResultIndex)
 {
-    if (compedAuditionSource == nullptr || compSegments.isEmpty())
+    const bool useActive = (compResultIndex == activeCompResultIndex);
+    const auto& rowSegments = useActive
+        ? compSegments
+        : compResults.getReference(compResultIndex).segments;
+
+    if (!useActive || compedAuditionSource == nullptr || rowSegments.isEmpty())
     {
         g.setColour(juce::Colours::lightgrey);
-        compedThumbnail.drawChannel(g, area, 0.0, compedThumbnail.getTotalLength(), 0, 1.0f);
+        if (compResultIndex >= 0
+            && compResultIndex < compResults.size()
+            && compResultIndex < kMaxCompResultRows)
+        {
+            if (auto* rowThumb = compResultThumbnails[(size_t)compResultIndex].get())
+            {
+                const double rowLen = rowThumb->getTotalLength();
+                if (rowLen > 0.0)
+                {
+                    const double compVisibleStart = juce::jlimit(0.0, rowLen, visibleStartSec - loopStartSec);
+                    const double compVisibleEnd = juce::jlimit(0.0, rowLen, visibleEndSec - loopStartSec);
+                    if (compVisibleEnd > compVisibleStart + 0.0001)
+                        rowThumb->drawChannel(g, area, compVisibleStart, compVisibleEnd, 0, 1.0f);
+                    return;
+                }
+            }
+        }
+
+        if (useActive && compedThumbnail.getTotalLength() > 0.0)
+        {
+            const double compLen = compedThumbnail.getTotalLength();
+            const double compVisibleStart = juce::jlimit(0.0, compLen, visibleStartSec - loopStartSec);
+            const double compVisibleEnd = juce::jlimit(0.0, compLen, visibleEndSec - loopStartSec);
+            if (compVisibleEnd > compVisibleStart + 0.0001)
+                compedThumbnail.drawChannel(g, area, compVisibleStart, compVisibleEnd, 0, 1.0f);
+        }
         return;
     }
 
@@ -482,13 +572,18 @@ void MainComponent::drawCompedWaveformRealtime(juce::Graphics& g,
     const int w = area.getWidth();
     const float mid = (float)area.getCentreY();
     const float amp = (float)area.getHeight() * 0.5f;
+    const double compVisibleStart = juce::jlimit(0.0, totalLen, visibleStartSec - loopStartSec);
+    const double compVisibleEnd = juce::jlimit(0.0, totalLen, visibleEndSec - loopStartSec);
+    if (compVisibleEnd <= compVisibleStart + 0.0001)
+        return;
+    const double compVisibleSpan = juce::jmax(0.0001, compVisibleEnd - compVisibleStart);
 
     int cachedSeg = 0;
 
     for (int x = 0; x < w; ++x)
     {
-        const double t0 = totalLen * (double)x / (double)w;
-        const double t1 = totalLen * (double)(x + 1) / (double)w;
+        const double t0 = compVisibleStart + compVisibleSpan * (double)x / (double)w;
+        const double t1 = compVisibleStart + compVisibleSpan * (double)(x + 1) / (double)w;
 
         int s0 = (int)std::floor(t0 * sr);
         int s1 = (int)std::floor(t1 * sr);
@@ -500,7 +595,7 @@ void MainComponent::drawCompedWaveformRealtime(juce::Graphics& g,
         for (int s = s0; s <= s1; s += step)
         {
             double t = (double)s / sr;
-            float v = renderCompSampleAtTime(t, cachedSeg);
+            float v = renderCompSampleAtTime(t, cachedSeg, compResultIndex);
             minV = juce::jmin(minV, v);
             maxV = juce::jmax(maxV, v);
         }
@@ -531,12 +626,15 @@ void MainComponent::paintCompReviewView(juce::Graphics& g)
     if (instrumentalLength > 0.0)
     {
         auto innerBounds = instrumentalWaveformBounds.reduced(2);
+        const double viewStart = juce::jlimit(0.0, instrumentalLength, visibleStartSec);
+        const double viewEnd = juce::jlimit(viewStart + 0.0001, instrumentalLength, visibleEndSec);
+        const double viewSpan = juce::jmax(0.0001, viewEnd - viewStart);
 
         g.setColour(juce::Colours::darkgrey.brighter(0.3f));
         thumbnail.drawChannel(g,
             innerBounds,
-            0.0,
-            instrumentalLength,
+            viewStart,
+            viewEnd,
             0,
             1.0f);
 
@@ -546,10 +644,12 @@ void MainComponent::paintCompReviewView(juce::Graphics& g)
 
         if (hasValidLoop())
         {
+            const double loopVisStart = juce::jmax(loopStartSec, viewStart);
+            const double loopVisEnd = juce::jmin(loopEndSec, viewEnd);
             const double startProp =
-                juce::jlimit(0.0, 1.0, loopStartSec / instrumentalLength);
+                juce::jlimit(0.0, 1.0, (loopVisStart - viewStart) / viewSpan);
             const double endProp =
-                juce::jlimit(0.0, 1.0, loopEndSec / instrumentalLength);
+                juce::jlimit(0.0, 1.0, (loopVisEnd - viewStart) / viewSpan);
 
             const int totalW = innerBounds.getWidth();
 
@@ -563,20 +663,23 @@ void MainComponent::paintCompReviewView(juce::Graphics& g)
                 loopW,
                 innerBounds.getHeight());
 
-            g.setColour(juce::Colours::lightgreen);
-            thumbnail.drawChannel(g,
-                loopRect,
-                loopStartSec,
-                loopEndSec,
-                0,
-                1.0f);
+            if (loopVisEnd > loopVisStart + 0.0001)
+            {
+                g.setColour(juce::Colours::lightgreen);
+                thumbnail.drawChannel(g,
+                    loopRect,
+                    loopVisStart,
+                    loopVisEnd,
+                    0,
+                    1.0f);
+            }
         }
 
         const double current = getPlayheadPositionSec();
         if (current >= 0.0 && instrumentalLength > 0.0)
         {
             const double proportion =
-                juce::jlimit(0.0, 1.0, current / instrumentalLength);
+                juce::jlimit(0.0, 1.0, (current - viewStart) / viewSpan);
 
             const int x = instrumentalWaveformBounds.getX()
                 + juce::roundToInt(proportion
@@ -597,26 +700,39 @@ void MainComponent::paintCompReviewView(juce::Graphics& g)
 
             const float topY = (float)instrumentalWaveformBounds.getY();
             const float bottomY = (float)instrumentalWaveformBounds.getBottom();
+            const int viewLeft = instrumentalWaveformBounds.getX();
+            const int viewRight = instrumentalWaveformBounds.getRight();
 
             g.setColour(juce::Colours::red);
 
-            g.drawLine((float)xStart, topY, (float)xStart, bottomY, 2.0f);
-            g.drawLine((float)xEnd, topY, (float)xEnd, bottomY, 2.0f);
+            const bool drawStart = (xStart >= viewLeft && xStart <= viewRight);
+            const bool drawEnd = (xEnd >= viewLeft && xEnd <= viewRight);
+
+            if (drawStart)
+                g.drawLine((float)xStart, topY, (float)xStart, bottomY, 2.0f);
+            if (drawEnd)
+                g.drawLine((float)xEnd, topY, (float)xEnd, bottomY, 2.0f);
 
             const float arrowHeight = 10.0f;
             const float arrowHalfW = 6.0f;
 
-            juce::Path startArrow;
-            startArrow.addTriangle((float)xStart, topY,
-                (float)xStart - arrowHalfW, topY - arrowHeight,
-                (float)xStart + arrowHalfW, topY - arrowHeight);
-            g.fillPath(startArrow);
+            if (drawStart)
+            {
+                juce::Path startArrow;
+                startArrow.addTriangle((float)xStart, topY,
+                    (float)xStart - arrowHalfW, topY - arrowHeight,
+                    (float)xStart + arrowHalfW, topY - arrowHeight);
+                g.fillPath(startArrow);
+            }
 
-            juce::Path endArrow;
-            endArrow.addTriangle((float)xEnd, topY,
-                (float)xEnd - arrowHalfW, topY - arrowHeight,
-                (float)xEnd + arrowHalfW, topY - arrowHeight);
-            g.fillPath(endArrow);
+            if (drawEnd)
+            {
+                juce::Path endArrow;
+                endArrow.addTriangle((float)xEnd, topY,
+                    (float)xEnd - arrowHalfW, topY - arrowHeight,
+                    (float)xEnd + arrowHalfW, topY - arrowHeight);
+                g.fillPath(endArrow);
+            }
         }
     }
     else
@@ -629,9 +745,7 @@ void MainComponent::paintCompReviewView(juce::Graphics& g)
             2);
     }
 
-    const double compLength = compedThumbnail.getTotalLength();
-    const bool   canDrawComped =
-        hasLastCompResult && hasCompedThumbnail && (compLength > 0.0);
+    const bool canDrawComped = hasLastCompResult && !compResults.isEmpty();
 
     if (takesAreaBounds.isEmpty())
         return;
@@ -647,228 +761,186 @@ void MainComponent::paintCompReviewView(juce::Graphics& g)
         return;
     }
 
-    juce::Rectangle<int> row, labelRect, waveRect, controlsRect;
-    getCompRowLayout(row, labelRect, waveRect, controlsRect);
-    const int centerY = row.getCentreY();
-
     // Use Neon theme so it matches TakeLaneComponent
     const NeonTheme* tPtr = nullptr;
     if (auto* neon = dynamic_cast<NeonLookAndFeel*>(&getLookAndFeel()))
         tPtr = &neon->getTheme();
 
     auto panelCol = tPtr ? tPtr->panel : juce::Colours::darkgrey.darker(0.6f);
-    auto outlineCol = tPtr ? tPtr->controlOutline : juce::Colours::grey;
     auto selectCol = tPtr ? tPtr->accentCyan : juce::Colours::cyan;
     auto soloCol = tPtr ? tPtr->accentPink : juce::Colours::orange;
     auto textCol = tPtr ? tPtr->textSecondary : juce::Colours::white;
 
-    // Base card
-    g.setColour(panelCol);
-    g.fillRoundedRectangle(row.toFloat(), 4.0f);
+    const int rowCount = juce::jlimit(1, 3, compResults.size());
+    juce::Rectangle<int> row, labelRect, waveRect, controlsRect;
+    juce::Rectangle<int> activeTopBarRect;
+    juce::Rectangle<int> activeCompWaveArea;
 
-    // Waveform “slot” like in take lanes
-    auto waveOuter = waveRect.reduced(6, 8);
-    g.setColour(panelCol.darker(0.5f));
-    g.fillRect(waveOuter);
-    g.setColour(panelCol.brighter(0.25f));
-    g.drawRect(waveOuter);
-
-    // Selection / solo highlights
-    if (compedSolo)
+    for (int rowIndex = 0; rowIndex < rowCount; ++rowIndex)
     {
-        g.setColour(soloCol.withAlpha(0.12f));
+        const auto& result = compResults.getReference(rowIndex);
+        const bool rowIsActive = (rowIndex == activeCompResultIndex);
+
+        getCompRowLayout(rowIndex, rowCount, row, labelRect, waveRect, controlsRect);
+
+        g.setColour(panelCol);
         g.fillRoundedRectangle(row.toFloat(), 4.0f);
-    }
 
-    if (compedSelected)
-    {
-        g.setColour(selectCol.withAlpha(0.9f));
-        g.drawRoundedRectangle(row.toFloat().expanded(0.5f), 4.0f, 1.5f);
-    }
+        auto waveOuter = waveRect.reduced(6, 8);
+        g.setColour(panelCol.darker(0.5f));
+        g.fillRect(waveOuter);
+        g.setColour(panelCol.brighter(0.25f));
+        g.drawRect(waveOuter);
 
-    // ----- Left label area (COMPED TAKE + parameters) -----
-    auto labelArea = labelRect.reduced(8, 4);
-
-    juce::Rectangle<int> titleArea = labelArea.removeFromTop(22);
-    juce::Rectangle<int> accArea = labelArea.removeFromTop(18);
-    juce::Rectangle<int> emoArea = labelArea.removeFromTop(18);
-    juce::Rectangle<int> cfArea = labelArea.removeFromTop(18);
-
-    const int acc = juce::jlimit(0, 100, lastCompAlphaPct);
-    const int emo = juce::jlimit(0, 100, 100 - lastCompAlphaPct);
-    const int cf = juce::jlimit(0, 100, lastCompCrossfadePct);
-
-    g.setColour(textCol);
-    g.setFont(16.0f);
-    g.drawText("COMPED TAKE 1",
-        titleArea,
-        juce::Justification::centredLeft,
-        true);
-
-    g.setFont(14.0f);
-    g.drawText("Accuracy " + juce::String(acc) + "%", accArea,
-        juce::Justification::centredLeft, true);
-    g.drawText("Emotion " + juce::String(emo) + "%", emoArea,
-        juce::Justification::centredLeft, true);
-    g.drawText("Crossfade " + juce::String(cf) + "%", cfArea,
-        juce::Justification::centredLeft, true);
-
-    // ----- Comped waveform + top red bar with segment take numbers -----
-    auto inner = waveOuter.reduced(4);
-    const int topBarHeight = 22;
-    auto topBarRect = inner.removeFromTop(topBarHeight);
-    auto compWaveArea = inner;
-
-    drawCompedTopBar(g, topBarRect, compWaveArea);
-    drawCompedWaveformRealtime(g, compWaveArea);
-
-    // Manual crossfade regions + draggable handles (two white lines per boundary)
-// Draw overlay first so markers/playhead remain visible on top.
-    if (compBoundaries.size() > 0)
-    {
-        // Translucent overlay of the mixed region
-        g.setColour(juce::Colours::white.withAlpha(0.08f));
-        for (int b = 0; b < compBoundaries.size(); ++b)
+        if (result.solo)
         {
-            const auto& cb = compBoundaries.getReference(b);
-            int x1 = compedTimeToX(cb.xfadeStartSec, compWaveArea);
-            int x2 = compedTimeToX(cb.xfadeEndSec, compWaveArea);
-            if (x2 < x1) std::swap(x1, x2);
-
-            juce::Rectangle<int> r(x1,
-                compWaveArea.getY(),
-                juce::jmax(1, x2 - x1),
-                compWaveArea.getHeight());
-            g.fillRect(r);
+            g.setColour(soloCol.withAlpha(0.12f));
+            g.fillRoundedRectangle(row.toFloat(), 4.0f);
+        }
+        if (result.selected)
+        {
+            g.setColour(selectCol.withAlpha(0.9f));
+            g.drawRoundedRectangle(row.toFloat().expanded(0.5f), 4.0f, 1.5f);
         }
 
-        // The two white handle lines (start/end) per boundary
-        for (int b = 0; b < compBoundaries.size(); ++b)
+        auto labelArea = labelRect.reduced(8, 4);
+        juce::Rectangle<int> titleArea = labelArea.removeFromTop(22);
+        juce::Rectangle<int> accArea = labelArea.removeFromTop(18);
+        juce::Rectangle<int> emoArea = labelArea.removeFromTop(18);
+        juce::Rectangle<int> cfArea = labelArea.removeFromTop(18);
+
+        const int acc = juce::jlimit(0, 100, result.alphaPct);
+        const int emo = juce::jlimit(0, 100, 100 - result.alphaPct);
+        const int cf = juce::jlimit(0, 100, result.crossfadePct);
+
+        g.setColour(textCol);
+        g.setFont(16.0f);
+        g.drawText(getCompResultTitle(rowIndex), titleArea, juce::Justification::centredLeft, true);
+        g.setFont(14.0f);
+        g.drawText("Accuracy " + juce::String(acc) + "%", accArea, juce::Justification::centredLeft, true);
+        g.drawText("Emotion " + juce::String(emo) + "%", emoArea, juce::Justification::centredLeft, true);
+        g.drawText("Crossfade " + juce::String(cf) + "%", cfArea, juce::Justification::centredLeft, true);
+
+        auto inner = waveOuter.reduced(4);
+        const int topBarHeight = 22;
+        auto topBarRect = inner.removeFromTop(topBarHeight);
+        auto compWaveArea = inner;
+
+        drawCompedTopBar(g, topBarRect, compWaveArea, rowIndex);
+        drawCompedWaveformRealtime(g, compWaveArea, rowIndex);
+
+        if (rowIsActive)
         {
-            const auto& cb = compBoundaries.getReference(b);
-            const int x1 = compedTimeToX(cb.xfadeStartSec, compWaveArea);
-            const int x2 = compedTimeToX(cb.xfadeEndSec, compWaveArea);
-
-            const bool isActive = (b == activeBoundaryIndex && compDragMode != CompDragMode::None);
-            g.setColour(juce::Colours::white.withAlpha(isActive ? 1.0f : 0.85f));
-            const float thickness = isActive ? 2.5f : 2.0f;
-
-            g.drawLine((float)x1,
-                (float)topBarRect.getY(),
-                (float)x1,
-                (float)compWaveArea.getBottom(),
-                thickness);
-
-            g.drawLine((float)x2,
-                (float)topBarRect.getY(),
-                (float)x2,
-                (float)compWaveArea.getBottom(),
-                thickness);
+            activeTopBarRect = topBarRect;
+            activeCompWaveArea = compWaveArea;
         }
     }
 
+    const double nowMs = juce::Time::getMillisecondCounterHiRes();
+    if (!activeTopBarRect.isEmpty() && segmentTimingTipShowUntilMs > nowMs)
+    {
+        drawNeonTooltip(g,
+                        "Shift + Drag to edit the segment timing",
+                        activeTopBarRect.getCentreX(),
+                        activeTopBarRect.getY() - 24,
+                        true,
+                        neonLookAndFeel.getTheme());
+    }
 
-    // ALWAYS draw playhead over comped waveform while playing
+    if (!activeCompWaveArea.isEmpty() && compBoundaries.size() > 0)
+    {
+        {
+            juce::Graphics::ScopedSaveState ss(g);
+            g.reduceClipRegion(activeCompWaveArea);
+            g.setColour(juce::Colours::white.withAlpha(0.08f));
+            for (int b = 0; b < compBoundaries.size(); ++b)
+            {
+                const auto& cb = compBoundaries.getReference(b);
+                int x1 = compedTimeToX(cb.xfadeStartSec, activeCompWaveArea);
+                int x2 = compedTimeToX(cb.xfadeEndSec, activeCompWaveArea);
+                if (x2 < x1) std::swap(x1, x2);
+                g.fillRect(juce::Rectangle<int>(x1, activeCompWaveArea.getY(),
+                    juce::jmax(1, x2 - x1), activeCompWaveArea.getHeight()));
+            }
+        }
+
+        {
+            juce::Graphics::ScopedSaveState ss(g);
+            g.reduceClipRegion(activeTopBarRect.getUnion(activeCompWaveArea));
+            for (int b = 0; b < compBoundaries.size(); ++b)
+            {
+                const auto& cb = compBoundaries.getReference(b);
+                const int x1 = compedTimeToX(cb.xfadeStartSec, activeCompWaveArea);
+                const int x2 = compedTimeToX(cb.xfadeEndSec, activeCompWaveArea);
+                const bool isActive = (b == activeBoundaryIndex && compDragMode != CompDragMode::None);
+                g.setColour(juce::Colours::white.withAlpha(isActive ? 1.0f : 0.85f));
+                const float thickness = isActive ? 2.5f : 2.0f;
+                g.drawLine((float)x1, (float)activeTopBarRect.getY(), (float)x1, (float)activeCompWaveArea.getBottom(), thickness);
+                g.drawLine((float)x2, (float)activeTopBarRect.getY(), (float)x2, (float)activeCompWaveArea.getBottom(), thickness);
+            }
+        }
+    }
+
     const double compPos = takeTransport.getCurrentPosition();
-    if (compPos >= 0.0 && compLength > 0.0)
+    const double compLength = compedThumbnail.getTotalLength();
+    if (!activeCompWaveArea.isEmpty() && compPos >= 0.0 && compLength > 0.0)
     {
-        const double prop =
-            juce::jlimit(0.0, 1.0, compPos / compLength);
-
-        const int x = compWaveArea.getX()
-            + juce::roundToInt(prop * (double)compWaveArea.getWidth());
-
-        g.setColour(juce::Colours::yellow);
-        g.drawLine((float)x,
-            (float)compWaveArea.getY(),
-            (float)x,
-            (float)compWaveArea.getBottom(),
-            2.0f);
-    }
-
-    // Segment markers + take index labels in the red bar
-    g.setFont(14.0f);
-    g.setColour(juce::Colours::white);
-
-    for (int i = 0; i < compSegments.size(); ++i)
-    {
-        const auto& seg = compSegments.getReference(i);
-        if (!(seg.endSec > seg.startSec))
-            continue;
-
-        const int xStart = compedTimeToX(seg.startSec, compWaveArea);
-        const int xEnd = compedTimeToX(seg.endSec, compWaveArea);
-
-        g.setColour(juce::Colours::lightgreen);
-        g.drawLine((float)xStart,
-            (float)topBarRect.getY(),
-            (float)xStart,
-            (float)compWaveArea.getBottom(),
-            2.0f);
-
-        const int midX = xStart + (xEnd - xStart) / 2;
-        
-        // --- GREEN TRIANGLE HANDLE (skip first segment start) ---
-        if (i > 0)
+        const double compVisibleStart = juce::jlimit(0.0, compLength, visibleStartSec - loopStartSec);
+        const double compVisibleEnd = juce::jlimit(0.0, compLength, visibleEndSec - loopStartSec);
+        if (compVisibleEnd > compVisibleStart + 0.0001)
         {
-            const bool isActive =
-                (compDragMode == CompDragMode::SegmentBoundary &&
-                 activeBoundaryIndex == (i - 1));
-
-            g.setColour(isActive ? juce::Colours::lime : juce::Colours::lightgreen);
-
-            const float triH = 8.0f;
-            const float triHalfW = 6.0f;
-            const float yTop = (float)topBarRect.getY();
-
-            juce::Path tri;
-            tri.addTriangle((float)xStart, yTop,
-                            (float)xStart - triHalfW, yTop - triH,
-                            (float)xStart + triHalfW, yTop - triH);
-
-            g.fillPath(tri);
+            const double compVisibleSpan = juce::jmax(0.0001, compVisibleEnd - compVisibleStart);
+            const int x = activeCompWaveArea.getX()
+                + juce::roundToInt(juce::jlimit(0.0, 1.0, (compPos - compVisibleStart) / compVisibleSpan)
+                                   * (double)activeCompWaveArea.getWidth());
+            g.setColour(juce::Colours::yellow);
+            g.drawLine((float)x, (float)activeCompWaveArea.getY(), (float)x, (float)activeCompWaveArea.getBottom(), 2.0f);
         }
-        
-        const int labelWidth = 30;
-        juce::Rectangle<int> labelBox(midX - labelWidth / 2,
-            topBarRect.getY(),
-            labelWidth,
-            topBarRect.getHeight());
-
-        juce::String text = (seg.takeIndex > 0)
-            ? juce::String(seg.takeIndex)
-            : juce::String("-");
-        g.setColour(juce::Colours::white);
-        g.drawText(text,
-            labelBox,
-            juce::Justification::centred,
-            true);
     }
 
-    // No more boxSize/selectRect/soloRect painting – the real buttons draw themselves
+    {
+        juce::Graphics::ScopedSaveState ss(g);
+        g.reduceClipRegion(activeTopBarRect.getUnion(activeCompWaveArea));
+        g.setFont(14.0f);
+        g.setColour(juce::Colours::white);
+        for (int i = 0; i < compSegments.size(); ++i)
+        {
+            const auto& seg = compSegments.getReference(i);
+            if (!(seg.endSec > seg.startSec) || activeCompWaveArea.isEmpty())
+                continue;
 
+            const int xStart = compedTimeToX(seg.startSec, activeCompWaveArea);
+            const int xEnd = compedTimeToX(seg.endSec, activeCompWaveArea);
+            g.setColour(juce::Colours::lightgreen);
+            g.drawLine((float)xStart, (float)activeTopBarRect.getY(), (float)xStart, (float)activeCompWaveArea.getBottom(), 2.0f);
+            const int midX = xStart + (xEnd - xStart) / 2;
 
-    //const int boxSize = 14;
+            if (i > 0)
+            {
+                const bool isActive = (compDragMode == CompDragMode::SegmentBoundary && activeBoundaryIndex == (i - 1));
+                g.setColour(isActive ? juce::Colours::lime : juce::Colours::lightgreen);
+                juce::Path tri;
+                tri.addTriangle((float)xStart, (float)activeTopBarRect.getY(),
+                                (float)xStart - 6.0f, (float)activeTopBarRect.getY() - 8.0f,
+                                (float)xStart + 6.0f, (float)activeTopBarRect.getY() - 8.0f);
+                g.fillPath(tri);
+            }
 
-    //juce::Rectangle<int> selectRect(
-    //    controlsRect.getX() + controlsRect.getWidth() / 4 - boxSize / 2,
-    //    centerY - boxSize / 2,
-    //    boxSize, boxSize);
+            juce::Rectangle<int> labelBox(midX - 15, activeTopBarRect.getY(), 30, activeTopBarRect.getHeight());
+            g.setColour(juce::Colours::white);
+            g.drawText(seg.takeIndex > 0 ? juce::String(seg.takeIndex) : "-", labelBox, juce::Justification::centred, true);
+        }
+    }
 
-    //juce::Rectangle<int> soloRect(
-    //    controlsRect.getX() + 3 * controlsRect.getWidth() / 4 - boxSize / 2,
-    //    centerY - boxSize / 2,
-    //    boxSize, boxSize);
-
-    //g.setColour(juce::Colours::white);
-    //g.drawRect(selectRect, 1);
-    //g.drawRect(soloRect, 1);
-
-    //if (compedSelected)
-    //    g.fillRect(selectRect.reduced(3));
-
-    //if (compedSolo)
-    //    g.fillRect(soloRect.reduced(3));
+    if (zoomScaleTipShowUntilMs > nowMs && !instrumentalWaveformBounds.isEmpty())
+    {
+        drawNeonTooltip(g,
+                        "Ctrl + wheel to scale",
+                        instrumentalWaveformBounds.getX() + 26,
+                        instrumentalWaveformBounds.getY() + 26,
+                        false,
+                        neonLookAndFeel.getTheme());
+    }
 }
 
 //==============================================================================
@@ -914,6 +986,10 @@ void MainComponent::resized()
     bpmLabel.setBounds(bpmArea);
     bpmBounds = bpmArea;
 
+    topRow.removeFromLeft(8);
+    auto keyArea = topRow.removeFromLeft(125);
+    keyLabel.setBounds(keyArea);
+    keyBounds = keyArea;
 
     topRow.removeFromLeft(10);
     metronomeToggle.setBounds(topRow.removeFromLeft(110));
@@ -922,6 +998,9 @@ void MainComponent::resized()
         layoutRecordingView(area);
     else
         layoutCompReviewView(area);
+
+    if (viewMode == ViewMode::CompReview)
+        refreshCompedButtons();
 
     // Takes viewport only visible in Recording view
     takesViewport.setVisible(viewMode == ViewMode::Recording);
@@ -970,7 +1049,7 @@ void MainComponent::layoutRecordingView(juce::Rectangle<int> area)
     auto crossfadeColumn = compArea;
 
     // Common sizes for knobs
-    const int knobSize = 120; // 100–200px range as you wanted
+    const int knobSize = 120; // 100?200px range as you wanted
     const int titleHeight = 24;
     const int sideLabelHeight = 18;
 
@@ -1041,8 +1120,11 @@ void MainComponent::layoutRecordingView(juce::Rectangle<int> area)
     takesViewport.setBounds(takesAreaBounds);
 
     // No comped buttons in Recording view
-    compedSelectButton.setBounds(0, 0, 0, 0);
-    compedSoloButton.setBounds(0, 0, 0, 0);
+    for (int i = 0; i < compedSelectButtons.size(); ++i)
+    {
+        if (auto* b = compedSelectButtons[i]) b->setBounds(0, 0, 0, 0);
+        if (auto* b = compedSoloButtons[i]) b->setBounds(0, 0, 0, 0);
+    }
     layoutTakeLanes();
 
 
@@ -1094,30 +1176,35 @@ void MainComponent::layoutCompReviewView(juce::Rectangle<int> area)
     takeVolumeLabel.setBounds(takeVolLabelArea);
     takeVolumeSlider.setBounds(takeVolSliderArea);
 
+    const int rowCount = juce::jmax(1, juce::jmin(3, compResults.size()));
+    for (int rowIndex = 0; rowIndex < compedSelectButtons.size(); ++rowIndex)
     {
+        auto* selectBtn = compedSelectButtons[rowIndex];
+        auto* soloBtn = compedSoloButtons[rowIndex];
+        if (selectBtn == nullptr || soloBtn == nullptr)
+            continue;
+
+        if (rowIndex >= rowCount)
+        {
+            selectBtn->setBounds(0, 0, 0, 0);
+            soloBtn->setBounds(0, 0, 0, 0);
+            continue;
+        }
+
         juce::Rectangle<int> row, labelRect, waveRect, controlsRect;
-        getCompRowLayout(row, labelRect, waveRect, controlsRect);
+        getCompRowLayout(rowIndex, rowCount, row, labelRect, waveRect, controlsRect);
 
-        // UNCOMMENT WHEN MULTIPLE COMPED TAKES
-        //auto controlsForButtons = controlsRect;
-
-        // --- square + centered buttons ---
         auto controlsForButtons = controlsRect.reduced(6);
-        
-        const int gap = 8;
-
-        auto leftArea  = controlsForButtons.removeFromLeft(controlsForButtons.getWidth() / 2);
-        controlsForButtons.removeFromLeft(gap);
+        const int gapPx = 8;
+        auto leftArea = controlsForButtons.removeFromLeft(controlsForButtons.getWidth() / 2);
+        controlsForButtons.removeFromLeft(gapPx);
         auto rightArea = controlsForButtons;
-
-        // square size = smallest of width/height
         int side = juce::jmin(
-                      juce::jmin(leftArea.getWidth(),  rightArea.getWidth()),
-                      juce::jmin(leftArea.getHeight(), rightArea.getHeight())
-                  );
+            juce::jmin(leftArea.getWidth(), rightArea.getWidth()),
+            juce::jmin(leftArea.getHeight(), rightArea.getHeight()));
 
-        compedSelectButton.setBounds(leftArea.withSizeKeepingCentre(side, side));
-        compedSoloButton.setBounds(rightArea.withSizeKeepingCentre(side, side));
+        selectBtn->setBounds(leftArea.withSizeKeepingCentre(side, side));
+        soloBtn->setBounds(rightArea.withSizeKeepingCentre(side, side));
     }
 
 
@@ -1146,12 +1233,16 @@ double MainComponent::xToTime(float x) const
     if (totalLength <= 0.0 || instrumentalWaveformBounds.getWidth() <= 0)
         return 0.0;
 
+    const double visibleStart = juce::jlimit(0.0, totalLength, visibleStartSec);
+    const double visibleEnd = juce::jlimit(visibleStart + 0.0001, totalLength, visibleEndSec);
+    const double visibleSpan = juce::jmax(0.0001, visibleEnd - visibleStart);
+
     const double norm =
         juce::jlimit(0.0, 1.0,
             (x - (double)instrumentalWaveformBounds.getX())
             / (double)instrumentalWaveformBounds.getWidth());
 
-    return norm * totalLength;
+    return visibleStart + norm * visibleSpan;
 }
 
 int MainComponent::timeToX(double t) const
@@ -1160,8 +1251,10 @@ int MainComponent::timeToX(double t) const
     if (totalLength <= 0.0 || instrumentalWaveformBounds.getWidth() <= 0)
         return instrumentalWaveformBounds.getX();
 
-    const double prop =
-        juce::jlimit(0.0, 1.0, t / totalLength);
+    const double visibleStart = juce::jlimit(0.0, totalLength, visibleStartSec);
+    const double visibleEnd = juce::jlimit(visibleStart + 0.0001, totalLength, visibleEndSec);
+    const double visibleSpan = juce::jmax(0.0001, visibleEnd - visibleStart);
+    const double prop = (t - visibleStart) / visibleSpan;
 
     return instrumentalWaveformBounds.getX()
         + juce::roundToInt(prop * (double)instrumentalWaveformBounds.getWidth());
@@ -1169,13 +1262,47 @@ int MainComponent::timeToX(double t) const
 
 int MainComponent::compedTimeToX(double t, const juce::Rectangle<int>& area) const
 {
-    const double totalLength = compedThumbnail.getTotalLength();
-    if (totalLength <= 0.0 || area.getWidth() <= 0)
+    const double compLength = compedThumbnail.getTotalLength();
+    if (compLength <= 0.0 || area.getWidth() <= 0)
         return area.getX();
 
-    const double prop = juce::jlimit(0.0, 1.0, t / totalLength);
+    const double compVisibleStart = juce::jlimit(0.0, compLength, visibleStartSec - loopStartSec);
+    const double compVisibleEnd = juce::jlimit(0.0, compLength, visibleEndSec - loopStartSec);
+    if (compVisibleEnd <= compVisibleStart + 0.0001)
+    {
+        const double fallbackProp = t / compLength;
+        return area.getX() + juce::roundToInt(fallbackProp * (double)area.getWidth());
+    }
+
+    const double prop = (t - compVisibleStart) / (compVisibleEnd - compVisibleStart);
     return area.getX()
         + juce::roundToInt(prop * (double)area.getWidth());
+}
+
+void MainComponent::getCompRowLayout(int rowIndex,
+    int rowCount,
+    juce::Rectangle<int>& row,
+    juce::Rectangle<int>& labelRect,
+    juce::Rectangle<int>& waveRect,
+    juce::Rectangle<int>& controlsRect) const
+{
+    const int safeCount = juce::jmax(1, rowCount);
+    const int safeIndex = juce::jlimit(0, safeCount - 1, rowIndex);
+
+    auto allRows = takesAreaBounds.reduced(4);
+    const int gap = 6;
+    const int totalGap = gap * (safeCount - 1);
+    const int rowH = juce::jmax(60, (allRows.getHeight() - totalGap) / safeCount);
+    row = juce::Rectangle<int>(
+        allRows.getX(),
+        allRows.getY() + safeIndex * (rowH + gap),
+        allRows.getWidth(),
+        rowH);
+
+    auto tmp = row;
+    labelRect = tmp.removeFromLeft(130);   // left info panel
+    controlsRect = tmp.removeFromRight(140); // right Select/Solo buttons
+    waveRect = tmp;                       // big waveform in the middle
 }
 
 void MainComponent::getCompRowLayout(juce::Rectangle<int>& row,
@@ -1183,12 +1310,7 @@ void MainComponent::getCompRowLayout(juce::Rectangle<int>& row,
     juce::Rectangle<int>& waveRect,
     juce::Rectangle<int>& controlsRect) const
 {
-    row = takesAreaBounds.reduced(4);
-
-    auto tmp = row;
-    labelRect = tmp.removeFromLeft(130);   // left info panel
-    controlsRect = tmp.removeFromRight(140); // right Select/Solo buttons
-    waveRect = tmp;                       // big waveform in the middle
+    getCompRowLayout(0, 1, row, labelRect, waveRect, controlsRect);
 }
 
 

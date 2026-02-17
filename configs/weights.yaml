@@ -1,5 +1,5 @@
 sample_rate: 48000         # project SR for I/O
-f0_sr: 16000               # 16 k for torchcrepe
+f0_sr: 16000               # 16 k for F0 extraction (librosa.pyin)
 frame_size: 1024 # might enlargen if too long processing
 hop_size: 256
 

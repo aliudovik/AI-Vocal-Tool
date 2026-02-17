@@ -1,9 +1,34 @@
 import numpy as np
 import librosa
-import torch
-import torchcrepe
 
 EPS = 1e-9
+
+NOTE_NAME_TO_PC = {
+    "C": 0,
+    "B#": 0,
+    "C#": 1,
+    "DB": 1,
+    "D": 2,
+    "D#": 3,
+    "EB": 3,
+    "E": 4,
+    "FB": 4,
+    "E#": 5,
+    "F": 5,
+    "F#": 6,
+    "GB": 6,
+    "G": 7,
+    "G#": 8,
+    "AB": 8,
+    "A": 9,
+    "A#": 10,
+    "BB": 10,
+    "B": 11,
+    "CB": 11,
+}
+
+MAJOR_INTERVALS = np.asarray([0, 2, 4, 5, 7, 9, 11], dtype=np.int32)
+MINOR_INTERVALS = np.asarray([0, 2, 3, 5, 7, 8, 10], dtype=np.int32)
 
 # -------------------- generic utils --------------------
 
@@ -12,6 +37,71 @@ def cents(f2, f1):
     f2 = np.maximum(f2, EPS)
     f1 = np.maximum(f1, EPS)
     return 1200.0 * np.log2(f2 / f1)
+
+
+def canonical_key_mode(mode):
+    raw = str(mode or "chromatic").strip().lower()
+    if raw in ("major", "maj"):
+        return "major"
+    if raw in ("minor", "min"):
+        return "minor"
+    return "chromatic"
+
+
+def canonical_key_root(root):
+    raw = str(root or "C").strip().upper().replace(" ", "")
+    if raw in NOTE_NAME_TO_PC:
+        return raw
+    if "/" in raw:
+        for part in raw.split("/"):
+            part = part.strip().upper()
+            if part in NOTE_NAME_TO_PC:
+                return part
+    return "C"
+
+
+def allowed_pitch_classes_for_key(key_mode, key_root):
+    mode = canonical_key_mode(key_mode)
+    if mode == "chromatic":
+        return np.arange(12, dtype=np.int32)
+
+    root_pc = NOTE_NAME_TO_PC[canonical_key_root(key_root)]
+    intervals = MAJOR_INTERVALS if mode == "major" else MINOR_INTERVALS
+    return (root_pc + intervals) % 12
+
+
+def in_key_voiced_ratio(f0, pd=None, pd_thresh=0.6, key_mode="chromatic", key_root="C", tolerance_cents=65.0):
+    """
+    Fraction of voiced frames that fall within the selected key.
+    A frame is in-key when the nearest allowed scale tone is within tolerance_cents.
+    Returns 0.0 when there are too few voiced frames.
+    """
+    if f0 is None or len(f0) == 0:
+        return 0.0
+
+    f0 = np.asarray(f0, dtype=np.float32)
+    if pd is None:
+        voiced = f0 > 0.0
+    else:
+        pd = np.asarray(pd, dtype=np.float32)
+        voiced = (f0 > 0.0) & (pd >= float(pd_thresh))
+
+    f0v = f0[voiced]
+    if len(f0v) < 5:
+        return 0.0
+
+    allowed_pc = allowed_pitch_classes_for_key(key_mode, key_root)
+    if allowed_pc.size == 0:
+        return 0.0
+
+    midi = 69.0 + 12.0 * np.log2(np.maximum(f0v, EPS) / 440.0)
+    pc = np.mod(midi, 12.0)[:, None]
+    allowed = allowed_pc.astype(np.float32)[None, :]
+    delta = np.abs(pc - allowed)
+    semitone_dist = np.minimum(delta, 12.0 - delta).min(axis=1)
+    dist_cents = 100.0 * semitone_dist
+    in_key = dist_cents <= float(tolerance_cents)
+    return float(np.mean(in_key))
 
 def band_score(x, low, mid, high):
     """
@@ -29,27 +119,60 @@ def band_score(x, low, mid, high):
 
 def f0_crepe_16k(y16k, sr16=16000, hop=320, device="cpu", model="tiny", mask_thresh=None):
     """
-    Pitch track with torchcrepe at 16 kHz. Returns (f0_hz, periodicity) as numpy arrays.
+    Fast pitch track at 16 kHz using librosa.yin.
+    Returns (f0_hz, periodicity) as numpy arrays.
+    `device` and `model` are kept for backward compatibility.
     """
-    # Expect shape [1, T]
-    x = torch.tensor(y16k, dtype=torch.float32, device=device)[None, :]
+    y16k = np.asarray(y16k, dtype=np.float32)
+    if y16k.size == 0:
+        return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32)
 
-    with torch.no_grad():
-        try:
-            f0, pd = torchcrepe.predict(
-                x, sr16, hop, 50, 1100,
-                model=model, batch_size=2048, device=device, return_periodicity=True
-            )
-        except TypeError:
-            f0 = torchcrepe.predict(
-                x, sr16, hop, 50, 1100,
-                model=model, batch_size=2048, device=device
-            )
-            pd = torch.ones_like(f0)
+    try:
+        hop = max(1, int(hop))
+        frame_length = max(1024, 4 * hop)
 
-        # light median smoothing
-        f0 = torchcrepe.filter.median(f0, 3).squeeze().detach().cpu().numpy()
-        pd = torchcrepe.filter.median(pd, 3).squeeze().detach().cpu().numpy()
+        f0 = librosa.yin(
+            y16k,
+            fmin=50.0,
+            fmax=1100.0,
+            sr=int(sr16),
+            frame_length=frame_length,
+            hop_length=hop,
+        )
+
+        # Lightweight periodicity proxy for voiced/unvoiced confidence.
+        # Higher RMS and lower ZCR generally indicate voiced content.
+        rms = librosa.feature.rms(
+            y=y16k,
+            frame_length=frame_length,
+            hop_length=hop,
+            center=True,
+        ).squeeze()
+        zcr = librosa.feature.zero_crossing_rate(
+            y16k,
+            frame_length=frame_length,
+            hop_length=hop,
+            center=True,
+        ).squeeze()
+    except Exception:
+        # Keep pipeline robust: return silent/unvoiced arrays on estimator failure.
+        n_frames = int(np.ceil(len(y16k) / max(1, int(hop))))
+        return np.zeros(n_frames, dtype=np.float32), np.zeros(n_frames, dtype=np.float32)
+
+    f0 = np.nan_to_num(f0, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    rms = np.nan_to_num(rms, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    zcr = np.nan_to_num(zcr, nan=1.0, posinf=1.0, neginf=1.0).astype(np.float32, copy=False)
+
+    n = min(len(f0), len(rms), len(zcr))
+    f0 = f0[:n]
+    rms = rms[:n]
+    zcr = zcr[:n]
+
+    lo = float(np.percentile(rms, 10))
+    hi = float(np.percentile(rms, 90))
+    rms_norm = np.clip((rms - lo) / (hi - lo + EPS), 0.0, 1.0)
+    zcr_norm = np.clip((zcr - 0.02) / 0.25, 0.0, 1.0)
+    pd = (rms_norm * (1.0 - zcr_norm)).astype(np.float32, copy=False)
 
     if mask_thresh is not None:
         mask = pd >= float(mask_thresh)
@@ -123,7 +246,7 @@ def clip_count(y):
 # -------------------- MVP emotion features --------------------
 
 def _frame_rate(sr16, hop):
-    """CREPE frame rate in Hz."""
+    """F0 frame rate in Hz."""
     return float(sr16) / float(hop)
 
 def vibrato_stability(f0, pd, sr16=16000, hop=256, pd_thresh=0.6, return_details=False):
